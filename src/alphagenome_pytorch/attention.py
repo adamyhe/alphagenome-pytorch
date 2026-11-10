@@ -162,6 +162,14 @@ class MHABlock(nn.Module):
         # nn.Module allows registering forward hooks to extract attn weights
         # e.g.: mha.attn_softmax.register_forward_hook(...)
         self.attn_softmax = nn.Softmax(dim=-1)
+        # Nonlinearities and products as modules, so attribution rules
+        # (e.g. DeepLIFT/SHAP) can attach to them. No parameters.
+        self.qk_matmul = layers.Bilinear()
+        self.logit_cap = nn.Tanh()
+        self.av_matmul = layers.Bilinear()
+        # In-place RoPE saves memory but cannot run under module backward
+        # hooks; attribution turns it off.
+        self.rope_inplace = True
 
     def forward(self, x, attention_bias, compute_dtype=None):
         B, S, D = x.shape
@@ -177,28 +185,28 @@ class MHABlock(nn.Module):
         k = self.norm_k(self.k_proj(h).view(B, S, 1, 128))
         v = self.norm_v(self.v_proj(h).view(B, S, 1, 192))
 
-        q = apply_rope(q, inplace=True)
-        k = apply_rope(k, inplace=True)
+        q = apply_rope(q, inplace=self.rope_inplace)
+        k = apply_rope(k, inplace=self.rope_inplace)
 
         q_t = q.permute(0, 2, 1, 3)  # (B, 8, S, C)
         k_t = k.permute(0, 2, 1, 3)  # (B, 1, S, C)
 
         # Attention logits: bf16 matmul then cast to f32 (matches JAX BF16_BF16_F32)
         # JAX uses precision=BF16_BF16_F32: bf16 inputs, f32 accumulation, f32 output
-        att = torch.matmul(q_t, k_t.transpose(-2, -1)).float()  # (B, 8, S, S)
+        att = self.qk_matmul(q_t, k_t.transpose(-2, -1)).float()  # (B, 8, S, S)
         att = att / math.sqrt(128.0)
 
         if attention_bias is not None:
             att = att + attention_bias.float()
 
         logits_soft_cap = 5.0
-        att = torch.tanh(att / logits_soft_cap) * logits_soft_cap
+        att = self.logit_cap(att / logits_soft_cap) * logits_soft_cap
 
         attn_weights = self.attn_softmax(att)
 
         # Value projection: bf16 matmul then cast back to compute dtype
         v_t = v.permute(0, 2, 1, 3)
-        y = torch.matmul(attn_weights.to(compute_dtype), v_t).float()  # (B, 8, S, 192)
+        y = self.av_matmul(attn_weights.to(compute_dtype), v_t).float()  # (B, 8, S, 192)
         y = y.to(compute_dtype)
         y = y.permute(0, 2, 1, 3).reshape(B, S, -1)
 
@@ -212,10 +220,11 @@ class MLPBlock(nn.Module):
         self.fc1 = nn.Linear(d_model, d_model * 2)
         self.fc2 = nn.Linear(d_model * 2, d_model)
         self.final_norm = layers.RMSBatchNorm(d_model, channels_last=True)
+        self.act = nn.ReLU()
 
     def forward(self, x):
         h = self.norm(x)
-        h = F.relu(self.fc1(h))
+        h = self.act(self.fc1(h))
         h = self.fc2(h)
         return self.final_norm(h)
 
@@ -224,10 +233,11 @@ class AttentionBiasBlock(nn.Module):
         super().__init__()
         self.norm = layers.RMSBatchNorm(pair_dim, channels_last=True)
         self.proj = nn.Linear(pair_dim, 8, bias=False)
+        self.act = nn.GELU()
 
     def forward(self, x):
         # x: (B, s, s, D)
-        h = F.gelu(self.norm(x))
+        h = self.act(self.norm(x))
         h = self.proj(h) # (B, s, s, 8)
         # Repeat 16x16
         h = torch.repeat_interleave(h, 16, dim=1)
@@ -260,6 +270,8 @@ class SequenceToPairBlock(nn.Module):
         self.linear_y_k = nn.Linear(d_model, self.head_dim, bias=False)
         
         self.linear_pair = nn.Linear(self.num_heads, self.head_dim) 
+        self.qk_einsum = layers.Bilinear('bqhc,bkhc->bqkh')
+        self.act = nn.GELU()
 
     def forward(self, x):
         # x: (B, S, D) - NLC format
@@ -290,11 +302,11 @@ class SequenceToPairBlock(nn.Module):
         rel_q_a = rel_q_a.permute(0, 2, 3, 1) # (B, S', S', H)
         rel_k_a = rel_k_a.permute(0, 3, 2, 1) # (B, S', S', H) from bhkp -> bpkh logic
         
-        a = torch.einsum('bqhc,bkhc->bqkh', q, k) # (B, S', S', H)
+        a = self.qk_einsum(q, k) # (B, S', S', H)
         a = a + 0.5 * (rel_q_a + rel_k_a)
         
         # y branches
-        x_gelu = F.gelu(x_norm)
+        x_gelu = self.act(x_norm)
         y_q = self.linear_y_q(x_gelu)
         y_k = self.linear_y_k(x_gelu)
         
@@ -316,6 +328,8 @@ class RowAttentionBlock(nn.Module):
         self.linear_v = nn.Linear(pair_dim, pair_dim)
         # nn.Module allows registering forward hooks to extract attn weights
         self.attn_softmax = nn.Softmax(dim=-1)
+        self.qk_einsum = layers.Bilinear('bpqf,bpkf->bpqk')
+        self.av_einsum = layers.Bilinear('bpqk,bpkf->bpqf')
 
     def forward(self, x, compute_dtype=None):
         if compute_dtype is None:
@@ -329,11 +343,11 @@ class RowAttentionBlock(nn.Module):
 
         # Attention: bf16 einsum then cast to f32 (matches JAX BF16_BF16_F32)
         scale = 1.0 / math.sqrt(128.0)
-        attn = torch.einsum('bpqf,bpkf->bpqk', q, k).float() * scale
+        attn = self.qk_einsum(q, k).float() * scale
         attn = self.attn_softmax(attn)
 
         # Value projection: bf16 einsum then cast back
-        out = torch.einsum('bpqk,bpkf->bpqf', attn.to(compute_dtype), v).float()
+        out = self.av_einsum(attn.to(compute_dtype), v).float()
         return out.to(compute_dtype)
 
 class PairMLPBlock(nn.Module):
@@ -342,11 +356,12 @@ class PairMLPBlock(nn.Module):
         self.norm = layers.LayerNorm(pair_dim, rms_norm=True)
         self.linear1 = nn.Linear(pair_dim, 2 * pair_dim)
         self.linear2 = nn.Linear(2 * pair_dim, pair_dim)
+        self.act = nn.ReLU()
         
     def forward(self, x):
         h = self.norm(x)
         h = self.linear1(h)
-        h = F.relu(h)
+        h = self.act(h)
         h = self.linear2(h)
         return h
 

@@ -11,6 +11,44 @@ def gelu(x):
     coef = torch.tensor(1.702, dtype=x.dtype, device=x.device)
     return torch.sigmoid(coef * x) * x
 
+
+class GELU(nn.Module):
+    """Module form of :func:`gelu` (JAX's ``sigmoid(1.702 * x) * x``).
+
+    A module rather than a function call so that attribution methods that
+    attach rules to modules (e.g. DeepLIFT/SHAP) can see the nonlinearity.
+    """
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return gelu(x)
+
+
+class Bilinear(nn.Module):
+    """A product of two activations, written as a module.
+
+    ``equation=None`` is ``torch.matmul(left, right)``; any other string is
+    passed to ``torch.einsum``. Operands are used exactly as passed. Exists so
+    that attribution methods that attach rules to modules can see products of
+    two input-dependent tensors (attention logits and values). The semantics
+    mirror ``tangermeme.deep_lift_shap.BilinearOp``.
+
+    When ``stage_operands`` is set (only during an attribution call), the
+    operands are left on the module as ``_staged`` for the rule to read.
+    """
+
+    def __init__(self, equation: str | None = None):
+        super().__init__()
+        self.equation = equation
+        self.stage_operands = False
+
+    def forward(self, left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
+        if self.stage_operands:
+            self._staged = {"left": left.detach(), "right": right.detach()}
+        if self.equation is None:
+            return torch.matmul(left, right)
+        return torch.einsum(self.equation, left, right)
+
+
 class Pool1d(nn.Module):
     """1D pooling with SAME padding. Expects NCL input (B, C, S).
 
@@ -22,6 +60,9 @@ class Pool1d(nn.Module):
         self.kernel_size = kernel_size
         self.stride = stride if stride is not None else kernel_size
         self.method = method
+        # Module (not F.max_pool1d) so attribution rules can attach to it.
+        if method == 'max':
+            self.max_pool = nn.MaxPool1d(kernel_size=self.kernel_size, stride=self.stride)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (B, C, S) - NCL format, no transpose needed
@@ -35,7 +76,7 @@ class Pool1d(nn.Module):
             x = F.pad(x, (pad_left, pad_right))
 
         if self.method == 'max':
-            return F.max_pool1d(x, kernel_size=self.kernel_size, stride=self.stride)
+            return self.max_pool(x)
         elif self.method in ['avg', 'mean']:
             return F.avg_pool1d(x, kernel_size=self.kernel_size, stride=self.stride)
         else:

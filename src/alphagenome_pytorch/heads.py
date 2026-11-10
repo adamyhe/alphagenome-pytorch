@@ -267,6 +267,7 @@ class GenomeTracksHead(nn.Module):
 
         self.convs = nn.ModuleDict()
         self.residual_scales = nn.ParameterDict()
+        self.softplus = nn.Softplus()  # module so attribution rules can attach
 
         for res in self.resolutions:
             res_str = str(res)
@@ -300,7 +301,7 @@ class GenomeTracksHead(nn.Module):
         scale = self.residual_scales[res_str][organism_index]
 
         # Softplus: softplus(x) * softplus(scale)
-        x = F.softplus(x) * F.softplus(scale.unsqueeze(2))
+        x = self.softplus(x) * F.softplus(scale.unsqueeze(2))
 
         return x
 

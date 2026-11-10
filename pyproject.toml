@@ -85,7 +85,10 @@ docs = [
     "myst-parser",
 ]
 dev = [
-    "alphagenome-pytorch[test,jax,scoring,docs]",
+    "alphagenome-pytorch[test,jax,scoring,docs,attribution]",
+]
+attribution = [
+    "tangermeme>=1.6.0",
 ]
 
 [tool.pytest.ini_options]

@@ -64,10 +64,11 @@ class ConvBlock(nn.Module):
             self.conv = nn.Conv1d(in_channels, out_channels, kernel_size=1)
         else:
             self.conv = StandardizedConv1d(in_channels, out_channels, kernel_size, padding='same')
+        self.act = layers.GELU()
 
     def forward(self, x):
         # x: (B, C, S) - NCL format, no transposes needed
-        return self.conv(layers.gelu(self.norm(x)))
+        return self.conv(self.act(self.norm(x)))
 
 class DnaEmbedder(nn.Module):
     """Embeds one-hot DNA to feature space. Expects NCL format (B, 4, S)."""

@@ -1,6 +1,7 @@
 """Nucleotide attribution methods for AlphaGenome models.
 
-Pure-Torch attribution primitives (gradient x input, saturation ISM) and a
+Pure-Torch attribution primitives (gradient x input, saturation ISM), DeepLIFT/SHAP
+through tangermeme (``pip install 'alphagenome-pytorch[attribution]'``), and a
 small method registry for wiring them into serving / scripts. No dependency
 on variant scoring, FASTA, or REST.
 
@@ -17,6 +18,13 @@ Example:
     ... )
 """
 
+from .deep_lift_shap import (
+    TrackTarget,
+    attributable,
+    attribution_ops,
+    deep_lift_shap,
+    deep_lift_shap_tracks,
+)
 from .gradient import gradient_x_input
 from .heads import HeadSelector, default_head_selector
 from .ism import saturation_ism
@@ -29,7 +37,12 @@ __all__ = [
     "HeadSelector",
     "METHODS",
     "MethodSpec",
+    "TrackTarget",
     "UnsupportedMethodError",
+    "attributable",
+    "attribution_ops",
+    "deep_lift_shap",
+    "deep_lift_shap_tracks",
     "default_head_selector",
     "get_method",
     "gradient_x_input",

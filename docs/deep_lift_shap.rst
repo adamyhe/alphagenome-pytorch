@@ -46,36 +46,58 @@ Quick start
 Engines
 -------
 
-``deep_lift_shap_tracks`` has two engines that compute the same multipliers
-from the same references (seeded as tangermeme seeds them):
+``deep_lift_shap_tracks`` has three engines that compute the same multipliers
+from the same references (seeded as tangermeme seeds them). ``engine="auto"``
+(the default) picks ``"blockwise"`` for ``AlphaGenome`` models and
+``"shared"`` otherwise.
 
-``engine="shared"`` (default)
-    Forwards each sequence once with gradients, and each reference once
-    without them, recording only the activations the rules read. It then runs
-    one one-row backward pass per (reference, track) over the kept graph,
-    calling tangermeme's rules on each sequence-reference pair. The graph is
-    one row wide instead of two. The sequence forward is shared by every
-    reference and track, and each reference forward by every track.
+``engine="blockwise"``
+    AlphaGenome-specific. Keeps no autograd graph outside the transformer
+    tower. The encoder, decoder, output embedders and head have a hand-written
+    backward: each block's activations are recomputed from its stored input,
+    for the sequence and a chunk of ``ref_batch_size`` references, turned into
+    tangermeme's multipliers (its rescale rule for GELU, softplus and the
+    experimental-space scaling, its max-pool rule for the encoder's pooling),
+    and applied to all references and tracks in the chunk at once. Only the
+    U-Net skips are kept between blocks. For a 1 bp head the decoder runs on
+    the window plus 2 kb only, since its receptive field is under 800 bp. The
+    tower runs on autograd with tangermeme's rules, over the sequence's
+    one-row graph.
+``engine="shared"``
+    Works with any model. Forwards each sequence once with gradients, and each
+    reference once without them, recording only the activations the rules
+    read. It then runs one one-row backward pass per (reference, track) over
+    the kept graph, calling tangermeme's rules on each sequence-reference pair.
 ``engine="stock"``
     Calls ``tangermeme.deep_lift_shap.deep_lift_shap`` once per track. This is
     the reference implementation.
 
-They agree to about 1e-13 in float64 and about 1e-5 in float32 on GPU, where
-different batch shapes choose different kernels. On an RTX 3080 (pretrained
-model, 4 references, 2 tracks):
+The blockwise and shared engines use the sequence half's gradient for both
+halves of each pair, which is exact because tangermeme's rules give both
+halves the same multiplier. The one exception is tangermeme's fallback where
+an activation barely changes (``|x - r| < 1e-6``): stock uses each half's own
+derivative there, so the engines differ from stock by about 1e-10 of the
+largest attribution in float64, and match it to 1e-13 with the fallback
+disabled. In float32 on GPU all three agree to about 1e-5, where different
+batch shapes choose different kernels.
 
-=============================  =================  =================
-Input                          stock              shared
-=============================  =================  =================
-4 kb, DNase @ 128 bp           2.3 s, 3.5 GiB     1.0 s, 3.1 GiB
-4 kb, DNase @ 1 bp             2.9 s, 5.9 GiB     1.4 s, 4.6 GiB
-32 kb, DNase @ 128 bp          5.2 s, 9.0 GiB     2.1 s, 7.8 GiB
-=============================  =================  =================
+On an RTX 3080 (10 GiB; pretrained model, 4 references, 2 tracks, a 1 kb
+window for 1 bp heads, ``PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True``):
 
-Peak memory includes 1.7 GiB of weights. The kept one-row graph is the largest
-remaining cost: about 3 GiB at 8 kb for a 1 bp head, growing linearly with
-length. When that graph does not fit in GPU memory, the shared engine can be
-slower than stock, because every backward pass reads the whole graph.
+=============================  ===============  ===============  ===============
+Input                          stock            shared           blockwise
+=============================  ===============  ===============  ===============
+4 kb, DNase @ 128 bp           2.1 s, 2.7 GiB   1.3 s, 2.6 GiB   1.1 s, 2.2 GiB
+4 kb, DNase @ 1 bp             2.2 s, 4.1 GiB   1.2 s, 3.6 GiB   1.3 s, 2.4 GiB
+16 kb, RNA-seq @ 1 bp          does not fit     3.2 s, 7.2 GiB   1.7 s, 3.6 GiB
+32 kb, DNase @ 128 bp          3.9 s, 7.3 GiB   2.0 s, 6.7 GiB   2.0 s, 3.6 GiB
+131 kb, DNase @ 128 bp         does not fit     does not fit     7.6 s, 7.3 GiB
+131 kb, RNA-seq @ 1 bp         does not fit     does not fit     7.5 s, 7.4 GiB
+=============================  ===============  ===============  ===============
+
+Peak memory includes 1.7 GiB of weights. The 131 kb rows use
+``ref_batch_size=1``. With 20 references (tangermeme's default) and one track,
+131 kb RNA-seq @ 1 bp takes 25 s at a 7.2 GiB peak.
 
 ``deep_lift_shap`` returns the same ``AttributionResult`` (``base_matrix``) as
 ``gradient_x_input``, for a single sequence and the attributed window only.
@@ -113,7 +135,7 @@ yourself, wrap the model with ``TrackTarget``, which gives tangermeme the
        attr = dls.deep_lift_shap(target, X, n_shuffles=20, random_state=0,
                                  additional_nonlinear_ops=attribution_ops())
 
-``attributable`` makes four changes and undoes them on exit:
+``attributable`` makes five changes and undoes them on exit:
 
 * ``layers.Bilinear`` modules stage their operands for the bilinear rule.
 * In-place RoPE is turned off. Module backward hooks reject in-place writes.
@@ -121,6 +143,8 @@ yourself, wrap the model with ``TrackTarget``, which gives tangermeme the
   forward hooks.
 * TF32 is turned off. With TF32 on, the prediction differences themselves are
   off by about 1e-3 relative.
+* Parameters stop requiring gradients, so autograd does not keep the
+  activations that only weight gradients need.
 
 Rules
 -----
@@ -157,18 +181,29 @@ counts over bins, are large enough that float32 rounding alone exceeds it.
 tangermeme's relative check (warn above 1% of the prediction differences)
 stays on.
 
-This path keeps tangermeme's full autograd graph for ``2 * batch_size`` rows.
-Measured peak GPU memory with ``batch_size=1`` on the pretrained model:
+With the blockwise engine, memory above the weights at the full 131 kb
+context is about:
 
-=================  ==================  ============
-Input length       Head @ resolution   Peak memory
-=================  ==================  ============
-4,096 bp           DNase @ 128 bp      3.5 GiB
-4,096 bp           DNase @ 1 bp        5.9 GiB
-16,384 bp          RNA-seq @ 1 bp      12.2 GiB
-32,768 bp          DNase @ 128 bp      9.0 GiB
-=================  ==================  ============
+* 0.9 GiB per row (the sequence, plus each reference in a chunk) for the U-Net
+  skips,
+* 1.7 GiB for the sequence's tower graph and 1.2 GiB for one reference's
+  tower activations,
+* about 1.5 GiB of transients for the backward of the 1 bp encoder layers,
+  growing with ``ref_batch_size * n_tracks``.
 
-Memory grows roughly linearly with length. Extrapolating linearly (not
-measured), the full 131,072 bp context needs about 30 GiB for a 128 bp head
-and about 80 GiB for a 1 bp head.
+So ``ref_batch_size=1`` fits a 10 GiB card at full length, and larger chunks
+(fewer, larger kernel launches) pay off on 24 GB or larger cards. Lower
+``track_batch_size`` to bound the gradient rows when attributing many tracks;
+each further batch of tracks recomputes the chunk's block activations.
+
+Set ``PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`` before starting
+Python. The engine allocates many large tensors of different sizes, and
+without expandable segments PyTorch's caching allocator can reserve 30% more
+than it uses. On Windows (including WSL), a GPU that runs out of dedicated
+memory spills into system memory instead of raising an error, and runs
+several times slower.
+
+The stock engine keeps tangermeme's full autograd graph over
+``2 * batch_size`` rows: 2.7 GiB at 4 kb and 7.3 GiB at 32 kb above, and by
+linear extrapolation about 30 GiB for a 128 bp head and 80 GiB for a 1 bp head
+at 131 kb.

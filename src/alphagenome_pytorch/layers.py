@@ -64,8 +64,8 @@ class Pool1d(nn.Module):
         if method == 'max':
             self.max_pool = nn.MaxPool1d(kernel_size=self.kernel_size, stride=self.stride)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, C, S) - NCL format, no transpose needed
+    def pad(self, x: torch.Tensor) -> torch.Tensor:
+        """The SAME padding applied before pooling."""
         input_size = x.shape[-1]
         output_size = (input_size + self.stride - 1) // self.stride  # ceil division
         pad_total = max((output_size - 1) * self.stride + self.kernel_size - input_size, 0)
@@ -74,7 +74,11 @@ class Pool1d(nn.Module):
 
         if pad_total > 0:
             x = F.pad(x, (pad_left, pad_right))
+        return x
 
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, C, S) - NCL format, no transpose needed
+        x = self.pad(x)
         if self.method == 'max':
             return self.max_pool(x)
         elif self.method in ['avg', 'mean']:

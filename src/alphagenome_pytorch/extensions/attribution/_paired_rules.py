@@ -29,6 +29,15 @@ from torch import nn
 _READS_BOTH = ("input", "output")
 
 
+def _elementwise_rules():
+    """Rules that only apply to elementwise modules, whose output can be recomputed."""
+    try:
+        from tangermeme._deep_lift_utils import _nonlinear
+    except ImportError:  # pragma: no cover
+        return ()
+    return (_nonlinear,)
+
+
 class PairedRules:
     """Forward and backward hooks implementing sequence-only DeepLIFT backward passes.
 
@@ -53,12 +62,18 @@ class PairedRules:
             ``tangermeme._deep_lift_utils._build_nonlinear_ops``.
         clone: Clone recorded activations. Only needed if the model writes in
             place to a hooked module's input or output after the module ran.
+        recompute_outputs: For modules under the rescale rule (elementwise by
+            definition), record only the reference's input and recompute its
+            output in the backward hook. The sequence's output is kept either
+            way, since autograd usually saves it already.
     """
 
-    def __init__(self, model: nn.Module, nonlinear_ops: dict, clone: bool = False):
+    def __init__(self, model: nn.Module, nonlinear_ops: dict, clone: bool = False,
+                 recompute_outputs: bool = True):
         self.model = model
         self.ops = nonlinear_ops
         self.clone = clone
+        self._elementwise = _elementwise_rules() if recompute_outputs else ()
         self._handles = []
         self._mode = None
         self._caches = {"x": {}, "ref": {}}
@@ -104,6 +119,10 @@ class PairedRules:
         self._caches = {"x": {}, "ref": {}}
         self._counters = {}
 
+    def clear_reference(self):
+        """Drop the recorded reference activations (once its backward passes are done)."""
+        self._caches["ref"] = {}
+
     # -- hooks ------------------------------------------------------------
 
     def _f_hook(self, module, inputs, output):
@@ -118,7 +137,9 @@ class PairedRules:
         entry = {name: keep(t) for name, t in staged.items()}
         if "input" in reads:
             entry["input"] = keep(inputs[0])
-        if "output" in reads:
+        if "output" in reads and not (
+            self._mode == "ref" and self.ops[type(module)] in self._elementwise
+        ):
             entry["output"] = keep(output)
         self._caches[self._mode][(id(module), idx)] = entry
 
@@ -139,6 +160,9 @@ class PairedRules:
                 "reference forward inside rules.recording('ref') before backward."
             )
 
+        if "output" in x_entry and "output" not in r_entry:
+            with torch.no_grad():
+                r_entry = {**r_entry, "output": module.forward(r_entry["input"])}
         for name, xt in x_entry.items():
             setattr(module, name, torch.cat([xt, r_entry[name].to(xt.dtype)]))
         try:

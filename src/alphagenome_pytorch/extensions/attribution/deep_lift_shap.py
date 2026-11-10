@@ -22,9 +22,11 @@ RoPE, residuals, U-Net skips, mean pooling, repeats, organism embeddings) is
 linear in the input, so its ordinary gradient is exact. Attributions therefore
 satisfy summation-to-delta up to floating-point error.
 
-This path keeps tangermeme's full autograd graph over ``2 * batch_size`` rows,
-so it is memory-hungry at the full 131 kb context. It is the reference a
-faster engine is checked against.
+``deep_lift_shap_tracks`` runs one of three engines that compute the same
+multipliers: stock tangermeme (the reference, which keeps a full autograd graph
+over ``2 * batch_size`` rows), the model-agnostic shared-forward engine
+(``_shared_forward``), and the AlphaGenome-specific blockwise engine
+(``_blockwise``), which is the default for AlphaGenome models.
 """
 
 from __future__ import annotations
@@ -196,12 +198,17 @@ def attributable(model: nn.Module):
     * TF32 is turned off for matmuls and cuDNN convolutions. With it on, the
       prediction differences tangermeme checks against are themselves off by
       ~1e-3 relative, and convergence cannot be told apart from TF32 error.
+    * Parameters stop requiring gradients, so autograd does not save the
+      activations only weight gradients would need.
     """
     saved = []
+    frozen = [p for p in model.parameters() if p.requires_grad]
     tf32 = (torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32)
     try:
         torch.backends.cuda.matmul.allow_tf32 = False
         torch.backends.cudnn.allow_tf32 = False
+        for p in frozen:
+            p.requires_grad_(False)
         for m in model.modules():
             if isinstance(m, layers.Bilinear):
                 saved.append((m, "stage_operands", m.stage_operands))
@@ -215,6 +222,8 @@ def attributable(model: nn.Module):
         yield model
     finally:
         torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32 = tf32
+        for p in frozen:
+            p.requires_grad_(True)
         for m, name, value in reversed(saved):
             setattr(m, name, value)
         for m in model.modules():
@@ -251,7 +260,9 @@ def deep_lift_shap_tracks(
     warning_threshold: Optional[float] = None,
     device: Optional[str | torch.device] = None,
     verbose: bool = False,
-    engine: str = "shared",
+    engine: str = "auto",
+    ref_batch_size: int = 4,
+    track_batch_size: Optional[int] = None,
 ) -> torch.Tensor:
     """DeepLIFT/SHAP attributions over the whole input.
 
@@ -288,13 +299,26 @@ def deep_lift_shap_tracks(
             are ~1e-6 of the prediction differences.
         device: Device to run on (default: the model's).
         verbose: ``engine="stock"`` only: show tangermeme's progress bar.
-        engine: ``"shared"`` (default) forwards each sequence once with
-            gradients, each reference once without, and runs one one-row
-            backward per (reference, track) over the kept graph, applying
-            tangermeme's rules (see ``_shared_forward``). ``"stock"`` calls
-            ``tangermeme.deep_lift_shap.deep_lift_shap`` once per track. The two
-            agree to float rounding for the same references; the stock engine
-            is the reference implementation.
+        engine: Which implementation computes the multipliers. All three
+            agree to float rounding for the same references.
+
+            * ``"blockwise"``: keeps no autograd graph outside the transformer
+              tower. Recomputes each conv block for the sequence and a chunk
+              of references, applies the same rules in a hand-written
+              backward, and crops the decoder to the window for 1 bp heads
+              (see ``_blockwise``). Needs an ``AlphaGenome`` model.
+            * ``"shared"``: forwards each sequence once with gradients and
+              each reference once without, then runs one one-row backward
+              per (reference, track) over the kept graph (see
+              ``_shared_forward``). Works for any model with AlphaGenome's
+              forward signature.
+            * ``"stock"``: ``tangermeme.deep_lift_shap.deep_lift_shap`` once
+              per track. The reference implementation.
+            * ``"auto"`` (default): ``"blockwise"`` for ``AlphaGenome``
+              models, otherwise ``"shared"``.
+        ref_batch_size: ``engine="blockwise"`` only: references per chunk.
+        track_batch_size: ``engine="blockwise"`` only: tracks per backward
+            (default: all).
 
     Returns:
         ``(T, N, 4, L)`` float32 tensor on the CPU, ``T = len(track_indices)``.
@@ -327,6 +351,10 @@ def deep_lift_shap_tracks(
     else:
         kwargs["n_shuffles"] = n_shuffles
 
+    if engine == "auto":
+        from ...model import AlphaGenome
+
+        engine = "blockwise" if isinstance(model, AlphaGenome) else "shared"
     if engine == "shared":
         from tangermeme._deep_lift_utils import _build_nonlinear_ops
 
@@ -341,8 +369,28 @@ def deep_lift_shap_tracks(
                 device=device, dtype=torch.float32,
             )
         return result.attributions.float()
+    if engine == "blockwise":
+        from tangermeme._deep_lift_utils import _build_nonlinear_ops
+
+        from ._blockwise import blockwise_deep_lift_shap
+
+        with attributable(model):
+            result = blockwise_deep_lift_shap(
+                model, X, organism_index=organism_index, output_type=output_type,
+                resolution=resolution, target_slice=target_slice,
+                track_indices=track_indices, reduction=reduction,
+                experimental_space=experimental_space,
+                nonlinear_ops=_build_nonlinear_ops(attribution_ops()),
+                references=kwargs.get("references"), n_shuffles=n_shuffles,
+                random_state=random_state, hypothetical=hypothetical,
+                ref_batch_size=ref_batch_size, track_batch_size=track_batch_size,
+                device=device, dtype=torch.float32,
+            )
+        return result.attributions.float()
     if engine != "stock":
-        raise ValueError(f"engine must be 'shared' or 'stock'; got {engine!r}.")
+        raise ValueError(
+            f"engine must be 'auto', 'blockwise', 'shared' or 'stock'; got {engine!r}."
+        )
 
     out = []
     with attributable(model):

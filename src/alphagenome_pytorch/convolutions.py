@@ -17,9 +17,8 @@ class StandardizedConv1d(nn.Conv1d):
         # Scale parameter
         self.scale = nn.Parameter(torch.ones(out_channels, 1, 1))
 
-    def forward(self, x):
-        # x: (B, C, S) - NCL format
-        
+    def standardized_weight(self):
+        """The standardized, scaled kernel the forward pass convolves with."""
         # Weight standardization
         # JAX: w -= mean(w, axis=(0, 1)) -> (kernel_width, input_channels)
         # PyTorch weight: (out_channels, in_channels, kernel_width)
@@ -34,8 +33,12 @@ class StandardizedConv1d(nn.Conv1d):
         fan_in = self.in_channels * self.kernel_size[0]
         scale_factor = torch.rsqrt(torch.maximum(var * fan_in, torch.tensor(1e-4, device=w.device, dtype=w.dtype))) * self.scale
         
-        w_standardized = (w - mean) * scale_factor
-        
+        return (w - mean) * scale_factor
+
+    def forward(self, x):
+        # x: (B, C, S) - NCL format
+        w_standardized = self.standardized_weight()
+
         # Padding 'SAME' manually if needed, or use functional
         # For even kernel sizes, 'same' padding is asymmetric. JAX/TF usually pad more on the right.
         if self.pad_mode == 'same':

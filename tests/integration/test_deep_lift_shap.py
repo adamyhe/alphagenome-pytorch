@@ -72,3 +72,24 @@ def test_pretrained_shared_engine_matches_stock(model, output_type, resolution):
     shared = deep_lift_shap_tracks(model, engine="shared", **kw)
     # float32 on GPU: different batch shapes pick different kernels (~1e-5 observed).
     torch.testing.assert_close(shared, stock, rtol=0, atol=1e-3 * float(stock.abs().max()))
+
+
+@pytest.mark.parametrize(
+    "output_type,resolution,length,organism",
+    [("dnase", 128, L, 0), ("rna_seq", 1, L, 0), ("cage", 1, 16384, 1), ("chip_tf", 128, 16384, 0)],
+)
+def test_pretrained_blockwise_engine_matches_shared(model, output_type, resolution, length, organism):
+    """The 16 kb 1 bp case crops the decoder (window plus 2 kb of 16 kb)."""
+    from alphagenome_pytorch.extensions.attribution import deep_lift_shap_tracks
+
+    g = torch.Generator().manual_seed(2)
+    onehot = F.one_hot(torch.randint(0, 4, (1, length), generator=g), 4).float()
+    bins = length // resolution
+    half = 4 if resolution == 128 else 250
+    kw = dict(onehot=onehot, organism_index=organism, output_type=output_type,
+              resolution=resolution, target_slice=slice(bins // 2 - half, bins // 2 + half),
+              track_indices=[0, 5, 9], n_shuffles=3, random_state=0)
+    shared = deep_lift_shap_tracks(model, engine="shared", **kw)
+    block = deep_lift_shap_tracks(model, engine="blockwise", ref_batch_size=2, **kw)
+    # float32 on GPU: different batch shapes pick different kernels (~5e-6 observed).
+    torch.testing.assert_close(block, shared, rtol=0, atol=1e-3 * float(shared.abs().max()))

@@ -43,6 +43,40 @@ Quick start
    # hyp: (n_tracks, N, 4, L) hypothetical contributions, the input TF-MoDISco expects.
    # Multiply by the one-hot input to get contributions at the observed bases.
 
+Engines
+-------
+
+``deep_lift_shap_tracks`` has two engines that compute the same multipliers
+from the same references (seeded as tangermeme seeds them):
+
+``engine="shared"`` (default)
+    Forwards each sequence once with gradients, and each reference once
+    without them, recording only the activations the rules read. It then runs
+    one one-row backward pass per (reference, track) over the kept graph,
+    calling tangermeme's rules on each sequence-reference pair. The graph is
+    one row wide instead of two. The sequence forward is shared by every
+    reference and track, and each reference forward by every track.
+``engine="stock"``
+    Calls ``tangermeme.deep_lift_shap.deep_lift_shap`` once per track. This is
+    the reference implementation.
+
+They agree to about 1e-13 in float64 and about 1e-5 in float32 on GPU, where
+different batch shapes choose different kernels. On an RTX 3080 (pretrained
+model, 4 references, 2 tracks):
+
+=============================  =================  =================
+Input                          stock              shared
+=============================  =================  =================
+4 kb, DNase @ 128 bp           2.3 s, 3.5 GiB     1.0 s, 3.1 GiB
+4 kb, DNase @ 1 bp             2.9 s, 5.9 GiB     1.4 s, 4.6 GiB
+32 kb, DNase @ 128 bp          5.2 s, 9.0 GiB     2.1 s, 7.8 GiB
+=============================  =================  =================
+
+Peak memory includes 1.7 GiB of weights. The kept one-row graph is the largest
+remaining cost: about 3 GiB at 8 kb for a 1 bp head, growing linearly with
+length. When that graph does not fit in GPU memory, the shared engine can be
+slower than stock, because every backward pass reads the whole graph.
+
 ``deep_lift_shap`` returns the same ``AttributionResult`` (``base_matrix``) as
 ``gradient_x_input``, for a single sequence and the attributed window only.
 The full hypothetical contributions are in ``metadata["hypothetical"]``.
@@ -54,9 +88,8 @@ Output ``t`` is the ``reduction`` (``"sum"`` or ``"mean"``) over the bins in
 ``target_slice`` of track ``track_indices[t]``, in experimental space (what
 ``predict`` returns) by default. Pass ``experimental_space=False`` to
 attribute the model-space prediction instead. ``"max"`` is not supported
-because it has no DeepLIFT rule. Each track is a separate tangermeme call. With
-a fixed ``random_state``, every track uses the same dinucleotide-shuffled
-references.
+because it has no DeepLIFT rule. With a fixed ``random_state``, every track
+uses the same dinucleotide-shuffled references.
 
 Using tangermeme directly
 -------------------------

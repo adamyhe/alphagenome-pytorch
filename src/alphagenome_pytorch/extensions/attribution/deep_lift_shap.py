@@ -251,8 +251,9 @@ def deep_lift_shap_tracks(
     warning_threshold: Optional[float] = None,
     device: Optional[str | torch.device] = None,
     verbose: bool = False,
+    engine: str = "shared",
 ) -> torch.Tensor:
-    """DeepLIFT/SHAP attributions over the whole input, one pass per track.
+    """DeepLIFT/SHAP attributions over the whole input.
 
     Args:
         model: An AlphaGenome model with a float32 dtype policy.
@@ -263,16 +264,19 @@ def deep_lift_shap_tracks(
         output_type: Genome-track head name (e.g. ``"dnase"``).
         resolution: Output resolution in bp (1 or 128).
         target_slice: Resolution-bin slice of the attributed window.
-        track_indices: Tracks to attribute, one tangermeme call each.
+        track_indices: Tracks to attribute.
         reduction: ``"sum"`` or ``"mean"`` over the window bins.
         experimental_space: Attribute the experimental-space prediction (what
             ``predict`` returns) rather than the model-space one.
         n_shuffles: Dinucleotide-shuffled references per sequence (ignored when
             ``references`` is given).
         references: Optional ``(N, K, 4, L)`` references (tangermeme layout).
-        random_state: Seed for the shuffles. The same references are used for
-            every track. None draws fresh references per track.
-        batch_size: Sequence-reference pairs per forward (each pair is two rows).
+        random_state: Seed for the shuffles, drawn as tangermeme draws them, so
+            both engines use the same references. With a seed, every track uses
+            the same references. None draws unseeded references (per track with
+            ``engine="stock"``, once for all tracks with ``"shared"``).
+        batch_size: ``engine="stock"`` only: sequence-reference pairs per
+            forward (each pair is two rows).
         hypothetical: Return hypothetical contributions (for TF-MoDISco);
             otherwise contributions projected onto the observed bases.
         warning_threshold: Absolute convergence-delta threshold for
@@ -283,7 +287,14 @@ def deep_lift_shap_tracks(
             tangermeme's default of 1e-3; on the pretrained model the deltas
             are ~1e-6 of the prediction differences.
         device: Device to run on (default: the model's).
-        verbose: Show tangermeme's progress bar.
+        verbose: ``engine="stock"`` only: show tangermeme's progress bar.
+        engine: ``"shared"`` (default) forwards each sequence once with
+            gradients, each reference once without, and runs one one-row
+            backward per (reference, track) over the kept graph, applying
+            tangermeme's rules (see ``_shared_forward``). ``"stock"`` calls
+            ``tangermeme.deep_lift_shap.deep_lift_shap`` once per track. The two
+            agree to float rounding for the same references; the stock engine
+            is the reference implementation.
 
     Returns:
         ``(T, N, 4, L)`` float32 tensor on the CPU, ``T = len(track_indices)``.
@@ -315,6 +326,23 @@ def deep_lift_shap_tracks(
         kwargs["references"] = references.float().cpu()
     else:
         kwargs["n_shuffles"] = n_shuffles
+
+    if engine == "shared":
+        from tangermeme._deep_lift_utils import _build_nonlinear_ops
+
+        from ._shared_forward import shared_forward_deep_lift_shap
+
+        with attributable(model):
+            result = shared_forward_deep_lift_shap(
+                target, X, targets=range(len(target.track_indices)),
+                nonlinear_ops=_build_nonlinear_ops(attribution_ops()),
+                references=kwargs.get("references"), n_shuffles=n_shuffles,
+                random_state=random_state, hypothetical=hypothetical,
+                device=device, dtype=torch.float32,
+            )
+        return result.attributions.float()
+    if engine != "stock":
+        raise ValueError(f"engine must be 'shared' or 'stock'; got {engine!r}.")
 
     out = []
     with attributable(model):

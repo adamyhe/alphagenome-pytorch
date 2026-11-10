@@ -56,3 +56,19 @@ def test_pretrained_converges(model, output_type, resolution, organism):
     # float32 through a 450M-parameter model: ~1e-6 observed.
     rel = ((diff - summed).abs() / diff.abs().clamp_min(1e-6)).max()
     assert rel < 1e-4, (diff, summed)
+
+
+@pytest.mark.parametrize("output_type,resolution", [("dnase", 128), ("rna_seq", 1)])
+def test_pretrained_shared_engine_matches_stock(model, output_type, resolution):
+    from alphagenome_pytorch.extensions.attribution import deep_lift_shap_tracks
+
+    g = torch.Generator().manual_seed(1)
+    onehot = F.one_hot(torch.randint(0, 4, (1, L), generator=g), 4).float()
+    bins = L // resolution
+    kw = dict(onehot=onehot, organism_index=0, output_type=output_type,
+              resolution=resolution, target_slice=slice(bins // 2 - 4, bins // 2 + 4),
+              track_indices=[0, 5], n_shuffles=2, random_state=0)
+    stock = deep_lift_shap_tracks(model, engine="stock", **kw)
+    shared = deep_lift_shap_tracks(model, engine="shared", **kw)
+    # float32 on GPU: different batch shapes pick different kernels (~1e-5 observed).
+    torch.testing.assert_close(shared, stock, rtol=0, atol=1e-3 * float(stock.abs().max()))

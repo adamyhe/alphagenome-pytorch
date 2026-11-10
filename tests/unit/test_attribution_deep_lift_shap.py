@@ -347,3 +347,85 @@ def test_deep_lift_shap_requires_float32_policy():
             organism_index=0, output_type="rna_seq", resolution=128,
             target_slice=slice(0, 2), track_indices=[0],
         )
+
+
+# ---------------------------------------------------------------------------
+# Shared-forward engine: same multipliers as stock tangermeme
+# ---------------------------------------------------------------------------
+
+
+def _stock(model, X, targets, n_shuffles, seed, **kw):
+    return torch.stack([
+        dls.deep_lift_shap(
+            model, X, target=t, n_shuffles=n_shuffles, batch_size=n_shuffles,
+            additional_nonlinear_ops=attribution_ops(), dtype=X.dtype, device="cpu",
+            random_state=seed, warning_threshold=float("inf"), **kw,
+        )
+        for t in targets
+    ])
+
+
+@pytest.mark.parametrize("probe,length", [(_ConvProbe, 64), (_TowerProbe, 128)])
+@pytest.mark.parametrize("hypothetical", [False, True])
+def test_shared_forward_matches_stock(probe, length, hypothetical, keep_float64):
+    from tangermeme._deep_lift_utils import _build_nonlinear_ops
+
+    from alphagenome_pytorch.extensions.attribution._shared_forward import (
+        shared_forward_deep_lift_shap,
+    )
+
+    torch.manual_seed(0)
+    model = probe().double().eval()
+    X = _onehot(2, length, seed=8)
+    with attributable(model):
+        stock = _stock(model, X, [0, 1], n_shuffles=3, seed=5, hypothetical=hypothetical)
+        shared = shared_forward_deep_lift_shap(
+            model, X, targets=[0, 1], nonlinear_ops=_build_nonlinear_ops(attribution_ops()),
+            n_shuffles=3, random_state=5, hypothetical=hypothetical,
+            device="cpu", dtype=torch.float64,
+        )
+    torch.testing.assert_close(shared.attributions, stock, rtol=1e-10, atol=1e-12)
+    rel = shared.convergence_deltas / shared.output_diffs.abs().clamp_min(1e-12)
+    assert float(rel.max()) < 1e-10
+
+
+def test_shared_forward_references_match_tangermeme():
+    from alphagenome_pytorch.extensions.attribution._shared_forward import tangermeme_references
+
+    torch.manual_seed(0)
+    model = _ConvProbe().double().eval()
+    X = _onehot(3, 64, seed=9)
+    with attributable(model):
+        res = dls.deep_lift_shap(
+            model, X, n_shuffles=4, batch_size=5, return_references=True,
+            additional_nonlinear_ops=attribution_ops(), dtype=torch.float64,
+            device="cpu", random_state=11, warning_threshold=float("inf"),
+        )
+    torch.testing.assert_close(tangermeme_references(X, 4, 11).double(), res.references)
+
+
+def test_deep_lift_shap_tracks_engines_agree():
+    torch.manual_seed(0)
+    model = _FakeAlphaGenome(apply_squashing=True).eval()
+    onehot = _onehot(2, 256, seed=10).float().transpose(1, 2)
+    kw = dict(onehot=onehot, organism_index=1, output_type="rna_seq", resolution=1,
+              target_slice=slice(100, 140), track_indices=[2, 0], n_shuffles=3,
+              random_state=3, batch_size=3)
+    stock = deep_lift_shap_tracks(model, engine="stock", **kw)
+    shared = deep_lift_shap_tracks(model, engine="shared", **kw)
+    # float32: rounding only (exact agreement is checked in float64 above).
+    torch.testing.assert_close(shared, stock, rtol=0, atol=1e-4 * float(stock.abs().max()))
+
+
+def test_paired_rules_requires_reference_record():
+    from tangermeme._deep_lift_utils import _build_nonlinear_ops
+
+    from alphagenome_pytorch.extensions.attribution._paired_rules import PairedRules
+
+    model = _ConvProbe().double().eval()
+    x = _onehot(1, 64, seed=12).requires_grad_(True)
+    with PairedRules(model, _build_nonlinear_ops(attribution_ops())) as rules:
+        with rules.recording("x"):
+            y = model(x)
+        with pytest.raises(RuntimeError, match="reference"):
+            torch.autograd.grad(y[0, 0], x)

@@ -113,6 +113,49 @@ attribute the model-space prediction instead. ``"max"`` is not supported
 because it has no DeepLIFT rule. With a fixed ``random_state``, every track
 uses the same dinucleotide-shuffled references.
 
+Aggregate targets
+~~~~~~~~~~~~~~~~~
+
+Pass ``aggregates`` to attribute scalar combinations of the window predictions
+instead of each track separately. Each ``Aggregate`` is a sum of terms, and
+each term is a weighted sum of the window predictions ``y[t, w]`` of
+``track_indices``, an optional scalar link (such as ``log``), and a
+coefficient::
+
+    f(y) = sum_j coef_j * link_j(reduce_w(sum_t W_j[t, w] * y[t, w]))
+
+Weights are ``(T,)`` (per track) or ``(T, W)`` (per track and window bin).
+``reduction="mean"`` divides each weighted sum by the number of bins. The
+result has one row per aggregate.
+
+.. code-block:: python
+
+   from alphagenome_pytorch.extensions.attribution import Aggregate
+
+   T = model.heads["dnase"].num_tracks
+   k562 = torch.zeros(T); k562[k562_tracks] = 1 / len(k562_tracks)
+   hepg2 = torch.zeros(T); hepg2[hepg2_tracks] = 1 / len(hepg2_tracks)
+   attr = deep_lift_shap_tracks(
+       model, onehot=onehot, organism_index=0, output_type="dnase",
+       resolution=128, target_slice=slice(508, 516),
+       track_indices=list(range(T)),
+       aggregates=[
+           Aggregate.weighted(torch.ones(T), name="total"),
+           Aggregate.weighted(k562 - hepg2, name="contrast"),
+           Aggregate.log_ratio(k562, hepg2, pseudocount=1.0, name="lfc"),
+       ],
+   )  # (3, N, 4, L)
+
+This form is exact DeepLIFT: the sums are linear, and the rescale rule on a
+scalar link is its exact secant between the sequence and the reference, so
+attributions still sum to ``f(x) - f(r)``. A link can be any elementwise,
+differentiable torch function (``Term(weights, link=torch.sqrt)``). Its
+derivative is used where the sequence and reference sums differ by less than
+1e-6, as for every other rescale rule. An aggregate costs about what one
+track costs, however many tracks it combines: on the RTX 3080, two
+aggregates over all 768 RNA-seq tracks at 131 kb and 1 bp take 6.2 s, against
+5.2 s for one track. All three engines support aggregates.
+
 Using tangermeme directly
 -------------------------
 
@@ -155,7 +198,8 @@ Module                                      tangermeme rule
 ``layers.GELU``, ``nn.GELU``, ``nn.ReLU``,  rescale
 ``nn.Tanh`` (logit soft-cap),
 ``nn.Softplus`` (track heads),
-experimental-space scaling
+experimental-space scaling, aggregate
+links
 ``nn.MaxPool1d`` (encoder pooling)          max-pool
 ``nn.Softmax`` (sequence and row            softmax
 attention)

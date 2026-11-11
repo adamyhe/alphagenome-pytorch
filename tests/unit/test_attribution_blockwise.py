@@ -31,6 +31,7 @@ from alphagenome_pytorch.extensions.attribution import (  # noqa: E402
     deep_lift_shap_tracks,
 )
 from alphagenome_pytorch.extensions.attribution import _blockwise as bw  # noqa: E402
+from alphagenome_pytorch.extensions.attribution.targets import Aggregate, Term  # noqa: E402
 from alphagenome_pytorch.extensions.attribution._shared_forward import (  # noqa: E402
     shared_forward_deep_lift_shap,
 )
@@ -274,3 +275,117 @@ def test_blockwise_rejects_empty_window(mini):
         bw._make_plan(mini, organism_index=0, output_type="dnase", resolution=128,
                       target_slice=slice(4, 4), track_indices=[0], reduction="sum",
                       experimental_space=True, length=2048, decoder_margin=1024)
+
+
+# ---------------------------------------------------------------------------
+# Aggregate targets
+# ---------------------------------------------------------------------------
+
+
+def _aggregates(n_bins):
+    g = torch.Generator().manual_seed(7)
+    profile = torch.rand(3, n_bins, generator=g, dtype=torch.float64)
+    return [
+        Aggregate.weighted(torch.tensor([1.0, 1.0, 1.0]), name="sum"),
+        Aggregate.weighted(torch.tensor([0.5, -1.0, 2.0]), name="contrast"),
+        Aggregate.weighted(profile, name="profile"),
+        Aggregate.log_sum(torch.tensor([1.0, 0.0, 1.0]), pseudocount=0.5, name="log"),
+        Aggregate.log_ratio(torch.tensor([1.0, 0.0, 0.0]), torch.tensor([0.0, 1.0, 1.0]),
+                            name="lfc"),
+        Aggregate((Term(torch.tensor([1.0, 2.0, 0.0]), torch.sqrt, 0.3),
+                   Term(profile, None, -0.1)), name="mixed"),
+    ]
+
+
+def _both_agg(model, X, spec, aggs, **kw):
+    with attributable(model):
+        target = TrackTarget(model, **spec, aggregates=aggs)
+        shared = shared_forward_deep_lift_shap(
+            target, X, targets=range(target.n_outputs), nonlinear_ops=_ops(), n_shuffles=3,
+            random_state=4, hypothetical=True, device="cpu", dtype=torch.float64)
+        block = bw.blockwise_deep_lift_shap(
+            model, X, nonlinear_ops=_ops(), n_shuffles=3, random_state=4, hypothetical=True,
+            device="cpu", dtype=torch.float64, aggregates=aggs, **kw, **spec)
+    return shared, block
+
+
+@pytest.mark.parametrize("head,resolution,window,reduction,experimental", [
+    ("dnase", 128, slice(5, 9), "sum", True),
+    ("rna_seq", 128, slice(0, 3), "mean", True),
+    ("rna_seq", 1, slice(900, 1300), "mean", True),
+    ("dnase", 1, slice(0, 64), "sum", False),
+])
+def test_blockwise_aggregates_match_shared(mini, keep_float64, head, resolution, window,
+                                           reduction, experimental):
+    X = _onehot(1, 2048, seed=8)
+    spec = dict(organism_index=1, output_type=head, resolution=resolution, target_slice=window,
+                track_indices=[3, 0, 2], reduction=reduction, experimental_space=experimental)
+    aggs = _aggregates(window.stop - window.start)
+    shared, block = _both_agg(mini, X, spec, aggs, ref_batch_size=2, track_batch_size=4)
+    assert block.attributions.shape == (len(aggs), 1, 4, 2048)
+    torch.testing.assert_close(block.output_diffs, shared.output_diffs, rtol=1e-9, atol=1e-12)
+    for a in range(len(aggs)):
+        torch.testing.assert_close(block.attributions[a], shared.attributions[a], rtol=1e-9,
+                                   atol=1e-10 * float(shared.attributions[a].abs().max()))
+    # Exact DeepLIFT: attributions sum to f(x) - f(r).
+    rel = block.convergence_deltas / block.output_diffs.abs().amax(dim=(1, 2), keepdim=True)
+    assert float(rel.max()) < 1e-9
+
+
+def test_linear_aggregate_is_weighted_sum_of_tracks(mini, keep_float64):
+    """A linear aggregate's multipliers are the weighted per-track multipliers."""
+    X = _onehot(1, 2048, seed=9)
+    spec = dict(organism_index=0, output_type="rna_seq", resolution=1,
+                target_slice=slice(300, 400), track_indices=[0, 1, 3])
+    w = torch.tensor([0.7, -1.2, 2.0], dtype=torch.float64)
+    kw = dict(nonlinear_ops=_ops(), n_shuffles=2, random_state=4, raw_outputs=True,
+              device="cpu", dtype=torch.float64, **spec)
+    with attributable(mini):
+        per_track = bw.blockwise_deep_lift_shap(mini, X, **kw)
+        agg = bw.blockwise_deep_lift_shap(mini, X, aggregates=[Aggregate.weighted(w)], **kw)
+    expected = torch.einsum("t,tnk...->nk...", w, per_track.attributions)
+    torch.testing.assert_close(agg.attributions[0], expected, rtol=1e-10,
+                               atol=1e-12 * float(expected.abs().max()))
+
+
+def test_blockwise_aggregate_matches_stock_tangermeme(mini, keep_float64, monkeypatch):
+    """A log fold change through stock tangermeme (link rule fallback off, as above)."""
+    monkeypatch.setattr(rules, "_rescale",
+                        lambda di, do, gi, go: torch.where(di == 0, gi, go * (do / di)))
+    monkeypatch.setattr(bw, "_RESCALE_EPS", 1e-300)
+    X = _onehot(1, 2048, seed=10)
+    spec = dict(organism_index=0, output_type="dnase", resolution=1,
+                target_slice=slice(1000, 1100), track_indices=[1, 2])
+    aggs = [Aggregate.log_ratio(torch.tensor([1.0, 0.0]), torch.tensor([0.0, 1.0]))]
+    with attributable(mini):
+        stock = dls.deep_lift_shap(
+            TrackTarget(mini, **spec, aggregates=aggs), X, target=0, n_shuffles=2,
+            batch_size=2, hypothetical=True, additional_nonlinear_ops=attribution_ops(),
+            dtype=torch.float64, device="cpu", random_state=4, warning_threshold=float("inf"))
+        block = bw.blockwise_deep_lift_shap(
+            mini, X, nonlinear_ops=_ops(), n_shuffles=2, random_state=4, hypothetical=True,
+            device="cpu", dtype=torch.float64, aggregates=aggs, **spec)
+    torch.testing.assert_close(block.attributions[0], stock, rtol=0,
+                               atol=1e-12 * float(stock.abs().max()))
+
+
+def test_aggregates_through_deep_lift_shap_tracks():
+    model = MiniAlphaGenome(dtype=torch.float32)
+    onehot = _onehot(2, 2048, seed=11).float().transpose(1, 2)
+    aggs = [Aggregate.weighted(torch.ones(3)), Aggregate.log_sum(torch.ones(3))]
+    kw = dict(onehot=onehot, organism_index=1, output_type="dnase", resolution=128,
+              target_slice=slice(6, 10), track_indices=[0, 1, 2], n_shuffles=3,
+              random_state=1, aggregates=aggs)
+    shared = deep_lift_shap_tracks(model, engine="shared", **kw)
+    block = deep_lift_shap_tracks(model, engine="blockwise", **kw)
+    assert block.shape == (2, 2, 4, 2048)
+    assert float((block - shared).norm() / shared.norm()) < 1e-3
+
+
+@pytest.mark.parametrize("weights", [torch.ones(2), torch.ones(3, 5), torch.ones(3, 4, 1)])
+def test_aggregate_weight_shape_is_checked(mini, weights):
+    with pytest.raises(ValueError, match="expected"):
+        bw._make_plan(mini, organism_index=0, output_type="dnase", resolution=128,
+                      target_slice=slice(4, 8), track_indices=[0, 1, 2], reduction="sum",
+                      experimental_space=True, length=2048, decoder_margin=1024,
+                      aggregates=[Aggregate.weighted(weights)])

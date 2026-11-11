@@ -29,14 +29,17 @@ from .gradient import gradient_x_input
 from .heads import HeadSelector, default_head_selector
 from .ism import saturation_ism
 from .registry import METHODS, MethodSpec, UnsupportedMethodError, get_method
+from .targets import Aggregate, Term, log_link
 from .types import AttributionResult
 from .window import reduce_window, target_slice_for_resolution
 
 __all__ = [
+    "Aggregate",
     "AttributionResult",
     "HeadSelector",
     "METHODS",
     "MethodSpec",
+    "Term",
     "TrackTarget",
     "UnsupportedMethodError",
     "attributable",
@@ -46,6 +49,7 @@ __all__ = [
     "default_head_selector",
     "get_method",
     "gradient_x_input",
+    "log_link",
     "reduce_window",
     "saturation_ism",
     "target_slice_for_resolution",

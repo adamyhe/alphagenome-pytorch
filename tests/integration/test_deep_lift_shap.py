@@ -93,3 +93,26 @@ def test_pretrained_blockwise_engine_matches_shared(model, output_type, resoluti
     block = deep_lift_shap_tracks(model, engine="blockwise", ref_batch_size=2, **kw)
     # float32 on GPU: different batch shapes pick different kernels (~5e-6 observed).
     torch.testing.assert_close(block, shared, rtol=0, atol=1e-3 * float(shared.abs().max()))
+
+
+@pytest.mark.parametrize("output_type,resolution,length", [("dnase", 128, L), ("rna_seq", 1, 16384)])
+def test_pretrained_blockwise_aggregates_match_shared(model, output_type, resolution, length):
+    """All of a head's tracks in one target, and a log fold change between two halves."""
+    from alphagenome_pytorch.extensions.attribution import Aggregate, deep_lift_shap_tracks
+
+    g = torch.Generator().manual_seed(3)
+    onehot = F.one_hot(torch.randint(0, 4, (1, length), generator=g), 4).float()
+    bins = length // resolution
+    half = 4 if resolution == 128 else 250
+    T = model.heads[output_type].num_tracks
+    first = (torch.arange(T) < T // 2).float()
+    aggs = [Aggregate.weighted(torch.ones(T)), Aggregate.log_ratio(first, 1 - first)]
+    kw = dict(onehot=onehot, organism_index=0, output_type=output_type,
+              resolution=resolution, target_slice=slice(bins // 2 - half, bins // 2 + half),
+              track_indices=list(range(T)), n_shuffles=3, random_state=0, aggregates=aggs)
+    shared = deep_lift_shap_tracks(model, engine="shared", **kw)
+    block = deep_lift_shap_tracks(model, engine="blockwise", ref_batch_size=2, **kw)
+    assert block.shape == (2, 1, 4, length)
+    for a in range(2):
+        torch.testing.assert_close(block[a], shared[a], rtol=0,
+                                   atol=1e-3 * float(shared[a].abs().max()))

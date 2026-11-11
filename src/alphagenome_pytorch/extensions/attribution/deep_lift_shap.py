@@ -9,7 +9,8 @@ Module                                 Rule
 =====================================  ==========================================
 ``layers.GELU``, ``nn.GELU``,          rescale (``_nonlinear``)
 ``nn.ReLU``, ``nn.Tanh``,
-``nn.Softplus``, track unscaling
+``nn.Softplus``, track unscaling,
+aggregate links (``targets``)
 ``nn.MaxPool1d`` (encoder pooling)     ``_maxpool``
 ``nn.Softmax`` (both attentions)       ``_softmax``
 ``layers.LayerNorm``                   ``_layernorm`` / ``_rmsnorm`` (by
@@ -41,6 +42,7 @@ from torch import nn
 from ... import layers
 from ...attention import MHABlock
 from ...heads import GenomeTracksHead, predictions_scaling
+from .targets import Aggregate, _Link, prepare_aggregates
 from .types import BASES, AttributionResult
 
 
@@ -95,9 +97,10 @@ class TrackTarget(nn.Module):
 
     Output ``[:, t]`` is the ``reduction`` over the bins in ``target_slice`` of
     track ``track_indices[t]`` of head ``output_type`` at ``resolution``, in
-    experimental space if ``experimental_space`` else model space. The organism
-    is fixed at construction because tangermeme casts extra ``args`` to the
-    input dtype.
+    experimental space if ``experimental_space`` else model space. With
+    ``aggregates``, output ``[:, a]`` is instead aggregate ``a`` of those
+    tracks' window predictions (see :mod:`.targets`). The organism is fixed at
+    construction because tangermeme casts extra ``args`` to the input dtype.
     """
 
     def __init__(
@@ -111,6 +114,7 @@ class TrackTarget(nn.Module):
         track_indices: Sequence[int],
         reduction: str = "sum",
         experimental_space: bool = True,
+        aggregates: Optional[Sequence[Aggregate]] = None,
     ):
         super().__init__()
         if reduction not in _REDUCTIONS:
@@ -145,6 +149,22 @@ class TrackTarget(nn.Module):
             _ExperimentalScale(head, resolution, organism_index, self.track_indices)
             if experimental_space else None
         )
+        self.aggregates = None if aggregates is None else list(aggregates)
+        if self.aggregates is not None:
+            if not self.aggregates:
+                raise ValueError("aggregates must be non-empty (or None for per-track targets).")
+            for a, agg in enumerate(self.aggregates):
+                if not isinstance(agg, Aggregate):
+                    raise TypeError(f"aggregates[{a}] is {type(agg).__name__}, not an Aggregate.")
+            self.links = nn.ModuleList(
+                nn.ModuleList(_Link(t.link) if t.link is not None else nn.Identity()
+                              for t in agg.terms)
+                for agg in self.aggregates
+            )
+
+    @property
+    def n_outputs(self) -> int:
+        return len(self.track_indices) if self.aggregates is None else len(self.aggregates)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         onehot = x.transpose(1, 2)  # (N, L, 4)
@@ -158,7 +178,17 @@ class TrackTarget(nn.Module):
         out = out[:, self.target_slice][:, :, self.track_indices]
         if self.scale is not None:
             out = self.scale(out)
-        return out.sum(dim=1) if self.reduction == "sum" else out.mean(dim=1)
+        if self.aggregates is None:
+            return out.sum(dim=1) if self.reduction == "sum" else out.mean(dim=1)
+        y = out.transpose(1, 2)  # (N, T, W)
+        prepared = prepare_aggregates(self.aggregates, y.shape[1], y.shape[2], self.reduction,
+                                      dtype=y.dtype, device=y.device)
+        cols = []
+        for p, links in zip(prepared, self.links):
+            s = p.sums(y)
+            terms = [link(s[:, j:j + 1]) for j, link in enumerate(links)]
+            cols.append(torch.cat(terms, dim=1) @ p.coefs.to(y.dtype)[:, None])
+        return torch.cat(cols, dim=1)
 
 
 def attribution_ops() -> dict:
@@ -183,6 +213,7 @@ def attribution_ops() -> dict:
         layers.LayerNorm: _alphagenome_layer_norm,
         layers.Bilinear: rules._bilinear,
         _ExperimentalScale: rules._nonlinear,
+        _Link: rules._nonlinear,
     }
 
 
@@ -263,6 +294,7 @@ def deep_lift_shap_tracks(
     engine: str = "auto",
     ref_batch_size: int = 4,
     track_batch_size: Optional[int] = None,
+    aggregates: Optional[Sequence[Aggregate]] = None,
 ) -> torch.Tensor:
     """DeepLIFT/SHAP attributions over the whole input.
 
@@ -317,11 +349,16 @@ def deep_lift_shap_tracks(
             * ``"auto"`` (default): ``"blockwise"`` for ``AlphaGenome``
               models, otherwise ``"shared"``.
         ref_batch_size: ``engine="blockwise"`` only: references per chunk.
-        track_batch_size: ``engine="blockwise"`` only: tracks per backward
-            (default: all).
+        track_batch_size: ``engine="blockwise"`` only: targets (tracks, or
+            aggregates) per backward (default: all).
+        aggregates: Attribute these scalar combinations of the window
+            predictions of ``track_indices`` instead of each track separately
+            (see :class:`~.targets.Aggregate`). Each costs what one track
+            costs, however many tracks it combines.
 
     Returns:
-        ``(T, N, 4, L)`` float32 tensor on the CPU, ``T = len(track_indices)``.
+        ``(T, N, 4, L)`` float32 tensor on the CPU, ``T = len(track_indices)``,
+        or ``(A, N, 4, L)`` with ``A = len(aggregates)``.
     """
     dls, _ = _require_tangermeme()
     _check_fp32(model)
@@ -336,7 +373,7 @@ def deep_lift_shap_tracks(
         model, organism_index=organism_index, output_type=output_type,
         resolution=resolution, target_slice=target_slice,
         track_indices=track_indices, reduction=reduction,
-        experimental_space=experimental_space,
+        experimental_space=experimental_space, aggregates=aggregates,
     )
     X = onehot.detach().float().transpose(1, 2).contiguous().cpu()  # (N, 4, L)
     kwargs = dict(
@@ -362,7 +399,7 @@ def deep_lift_shap_tracks(
 
         with attributable(model):
             result = shared_forward_deep_lift_shap(
-                target, X, targets=range(len(target.track_indices)),
+                target, X, targets=range(target.n_outputs),
                 nonlinear_ops=_build_nonlinear_ops(attribution_ops()),
                 references=kwargs.get("references"), n_shuffles=n_shuffles,
                 random_state=random_state, hypothetical=hypothetical,
@@ -379,7 +416,7 @@ def deep_lift_shap_tracks(
                 model, X, organism_index=organism_index, output_type=output_type,
                 resolution=resolution, target_slice=target_slice,
                 track_indices=track_indices, reduction=reduction,
-                experimental_space=experimental_space,
+                experimental_space=experimental_space, aggregates=aggregates,
                 nonlinear_ops=_build_nonlinear_ops(attribution_ops()),
                 references=kwargs.get("references"), n_shuffles=n_shuffles,
                 random_state=random_state, hypothetical=hypothetical,
@@ -394,7 +431,7 @@ def deep_lift_shap_tracks(
 
     out = []
     with attributable(model):
-        for t in range(len(target.track_indices)):
+        for t in range(target.n_outputs):
             out.append(dls.deep_lift_shap(target, X, target=t, **kwargs).float())
     return torch.stack(out)
 
@@ -421,7 +458,8 @@ def deep_lift_shap(
 
     ``onehot`` is ``(1, L, 4)``. ``values[w, b, t]`` is the contribution at
     position ``w`` of the attributed window (the ``target_slice`` bins, in bp)
-    for the observed base; other cells are NaN. ``metadata["hypothetical"]``
+    for the observed base; other cells are NaN. With ``aggregates``, ``t``
+    indexes the aggregates (``metadata["aggregates"]`` holds their names). ``metadata["hypothetical"]``
     holds the full ``(W, 4, T)`` hypothetical contributions. Extra keyword
     arguments go to :func:`deep_lift_shap_tracks`.
     """
@@ -464,5 +502,7 @@ def deep_lift_shap(
         metadata={
             "n_shuffles": n_shuffles, "random_state": random_state,
             "hypothetical": hyp_w,
+            **({"aggregates": [a.name for a in kwargs["aggregates"]]}
+               if kwargs.get("aggregates") is not None else {}),
         },
     )

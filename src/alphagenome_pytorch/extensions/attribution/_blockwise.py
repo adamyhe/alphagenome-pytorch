@@ -39,6 +39,7 @@ from ...convolutions import StandardizedConv1d
 from ...heads import predictions_scaling
 from ._paired_rules import PairedRules
 from ._shared_forward import SharedForwardResult, tangermeme_references
+from .targets import prepare_aggregates
 
 # tangermeme's rescale rule falls back to the plain gradient below this |delta_in|.
 _RESCALE_EPS = 1e-6
@@ -304,14 +305,21 @@ class _Plan:
     trunk_bin: int
     crop: Optional[tuple] = None  # (c0, c1) bp, 1 bp heads
     win: Optional[tuple] = None   # (w0, w1) bp, window aligned to trunk bins
+    aggs: Optional[list] = None   # prepared aggregates (targets.prepare_aggregates)
 
     @property
     def n_bins(self) -> int:
         return self.hi - self.lo
 
+    @property
+    def n_rows(self) -> int:
+        """Attributed outputs: one per track, or one per aggregate."""
+        return len(self.tracks) if self.aggs is None else len(self.aggs)
+
 
 def _make_plan(model, *, organism_index, output_type, resolution, target_slice,
-               track_indices, reduction, experimental_space, length, decoder_margin):
+               track_indices, reduction, experimental_space, length, decoder_margin,
+               aggregates=None, dtype=torch.float64, device=None):
     head = model.heads[output_type]
     slot = 0 if head.num_organisms == 1 else int(organism_index)
     tb = model.encoder.pool.stride ** (len(model.encoder.down_blocks) + 1)
@@ -322,6 +330,11 @@ def _make_plan(model, *, organism_index, output_type, resolution, target_slice,
     plan = _Plan(model=model, head=head, org=int(organism_index), slot=slot,
                  res=int(resolution), lo=lo, hi=hi, tracks=[int(t) for t in track_indices],
                  reduction=reduction, experimental=experimental_space, L=length, trunk_bin=tb)
+    if aggregates is not None:
+        if not aggregates:
+            raise ValueError("aggregates must be non-empty (or None for per-track targets).")
+        plan.aggs = prepare_aggregates(aggregates, len(plan.tracks), hi - lo, reduction,
+                                       dtype=dtype, device=device)
     if resolution == 1:
         w0, w1 = (lo // tb) * tb, -(-hi // tb) * tb
         c0 = max(0, ((lo - decoder_margin) // tb) * tb)
@@ -360,7 +373,12 @@ def _tower(model, tin):
 
 
 def _head_states(plan, e):
-    """Head forward on window embeddings ``e`` (B, C, W). Returns (z, u, y)."""
+    """Head forward on window embeddings ``e`` (B, C, W).
+
+    Returns ``(z, u, y, s)``: head pre-activations and model-space predictions
+    ``(B, T, W)``, the attributed outputs ``(B, n_rows)``, and per aggregate its
+    term sums ``(B, J)`` (None without aggregates).
+    """
     head = plan.head
     res = str(plan.res)
     w = head.convs[res].weight[plan.slot, plan.tracks]  # (T, C)
@@ -368,9 +386,12 @@ def _head_states(plan, e):
     z = torch.einsum("bcs,tc->bts", e.float(), w.float()).to(e.dtype) + b[:, None]
     c = F.softplus(head.residual_scales[res][plan.slot, plan.tracks])
     u = head.softplus(z) * c[:, None]
-    y = _experimental(plan, u) if plan.experimental else u
-    y = y.sum(-1) if plan.reduction == "sum" else y.mean(-1)
-    return z, u, y
+    yb = _experimental(plan, u) if plan.experimental else u
+    if plan.aggs is None:
+        return z, u, (yb.sum(-1) if plan.reduction == "sum" else yb.mean(-1)), None
+    s = [p.sums(yb) for p in plan.aggs]
+    y = torch.stack([p.value(sj) for p, sj in zip(plan.aggs, s)], dim=1)
+    return z, u, y, s
 
 
 def _experimental(plan, u):
@@ -406,27 +427,37 @@ def _post_tower(plan, trunk_ncl, skips):
         a128 = _embedder_pre(m.embedder_128bp, trunk_ncl[..., plan.lo:plan.hi], plan.org)
         e = m.embedder_128bp.act(a128)
     st["a128"] = a128
-    st["z"], st["u"], st["y"] = _head_states(plan, e)
+    st["z"], st["u"], st["y"], st["s"] = _head_states(plan, e)
     return st
 
 
 # -- backward -------------------------------------------------------------------------
 
 
-def _post_tower_vjp(plan, sx, sr, ts, S_trunk):
-    """Head, embedders and decoder backward for tracks ``ts`` (indices into plan.tracks).
+def _agg_seed(p, s_x, s_r):
+    """Multipliers ``(k, J)`` of an aggregate wrt its term sums: coef times the link's secant."""
+    cols = []
+    for j, f in enumerate(p.links):
+        cols.append(torch.ones_like(s_r[:, j]) if f is None
+                    else _secant(f, s_x[:, j], s_r[:, j]))
+    return torch.stack(cols, dim=1) * p.coefs.to(s_r.dtype)
 
-    Returns (grad wrt tower output, NCL (k, T, C, S); skip grads {bin: (offset, grad)}).
+
+def _post_tower_vjp(plan, sx, sr, rows, S_trunk):
+    """Head, embedders and decoder backward for outputs ``rows`` (tracks or aggregates).
+
+    Returns (grad wrt tower output, NCL (k, R, C, S); skip grads {bin: (offset, grad)}).
     """
     m = plan.model
     head = plan.head
     res = str(plan.res)
+    ts = rows if plan.aggs is None else list(range(len(plan.tracks)))
     tracks = [plan.tracks[i] for i in ts]
     zx, zr = sx["z"][:, ts], sr["z"][:, ts]
     ux, ur = sx["u"][:, ts], sr["u"][:, ts]
-    k, T = zr.shape[0], len(ts)
+    k, T = zr.shape[0], len(rows)
 
-    G = torch.full_like(zr, 1.0 if plan.reduction == "sum" else 1.0 / plan.n_bins)
+    G = torch.ones_like(zr)  # head multipliers (k, tracks, W), model space -> output
     if plan.experimental:
         means = head.track_means[plan.slot, tracks].to(ux.dtype)
 
@@ -437,12 +468,24 @@ def _post_tower_vjp(plan, sx, sr, ts, S_trunk):
 
         G = G * _secant(S, ux, ur)
     c = F.softplus(head.residual_scales[res][plan.slot, tracks])
-    G = G * c[:, None] * _secant(head.softplus, zx, zr)  # (k, T, W)
-    w = head.convs[res].weight[plan.slot, tracks].to(G.dtype)  # (T, C)
-    g_e = torch.einsum("tc,ktw->ktcw", w, G)
+    G = G * c[:, None] * _secant(head.softplus, zx, zr)  # (k, tracks, W)
+    w = head.convs[res].weight[plan.slot, tracks].to(G.dtype)  # (tracks, C)
+    if plan.aggs is None:
+        if plan.reduction == "mean":
+            G = G / plan.n_bins
+        g_e = torch.einsum("tc,ktw->ktcw", w, G)
+    else:
+        g_e = []
+        for a in rows:
+            p = plan.aggs[a]
+            seed = _agg_seed(p, sx["s"][a], sr["s"][a])  # (k, J)
+            Ga = torch.einsum("kj,jtw->ktw", seed, p.weights.to(G.dtype)) * G
+            g_e.append(torch.einsum("tc,ktw->kcw", w, Ga))
+        g_e = torch.stack(g_e, dim=1)  # (k, R, C, W)
+    del G
 
     C_trunk = m.embedder_128bp.project_in.in_channels
-    g_trunk = G.new_zeros((k, T, C_trunk, S_trunk))
+    g_trunk = g_e.new_zeros((k, T, C_trunk, S_trunk))
     skip_grads = {}
     tb = plan.trunk_bin
     if plan.res == 1:
@@ -509,6 +552,7 @@ def blockwise_deep_lift_shap(
     nonlinear_ops: dict,
     reduction: str = "sum",
     experimental_space: bool = True,
+    aggregates: Optional[Sequence] = None,
     references: Optional[torch.Tensor] = None,
     n_shuffles: int = 20,
     random_state: Optional[int] = None,
@@ -527,15 +571,16 @@ def blockwise_deep_lift_shap(
         model: AlphaGenome, inside ``attributable(model)``.
         X: ``(N, 4, L)`` one-hot sequences.
         organism_index, output_type, resolution, target_slice, track_indices,
-            reduction, experimental_space: As for ``TrackTarget``.
+            reduction, experimental_space, aggregates: As for ``TrackTarget``.
         nonlinear_ops: Full rule table, used for the transformer tower.
         references, n_shuffles, random_state, hypothetical, raw_outputs: As
             for :func:`shared_forward_deep_lift_shap`.
         ref_batch_size: References per chunk (``k``). Memory grows with
             ``k`` (U-Net skips per reference) and ``k * track_batch_size``
             (gradient rows).
-        track_batch_size: Tracks per backward (default: all). Each further
-            batch of tracks recomputes the reference chunk's block activations.
+        track_batch_size: Outputs (tracks, or aggregates) per backward
+            (default: all). Each further batch recomputes the reference
+            chunk's block activations.
         decoder_margin: bp of decoder computed on each side of a 1 bp window.
             Must exceed the decoder's receptive radius (762 bp for AlphaGenome).
         device, dtype: Where and in what precision to run.
@@ -554,8 +599,9 @@ def blockwise_deep_lift_shap(
                       resolution=resolution, target_slice=target_slice,
                       track_indices=track_indices, reduction=reduction,
                       experimental_space=experimental_space, length=L,
-                      decoder_margin=decoder_margin)
-    T = len(plan.tracks)
+                      decoder_margin=decoder_margin, aggregates=aggregates,
+                      dtype=dtype, device=device)
+    T = plan.n_rows
     tbs = T if track_batch_size is None else max(1, int(track_batch_size))
     track_chunks = [list(range(i, min(T, i + tbs))) for i in range(0, T, tbs)]
     kbs = max(1, int(ref_batch_size))

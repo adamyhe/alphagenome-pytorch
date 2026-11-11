@@ -61,8 +61,10 @@ from the same references (seeded as tangermeme seeds them). ``engine="auto"``
     and applied to all references and tracks in the chunk at once. Only the
     U-Net skips are kept between blocks. For a 1 bp head the decoder runs on
     the window plus 2 kb only, since its receptive field is under 800 bp. The
-    tower runs on autograd with tangermeme's rules, over the sequence's
-    one-row graph.
+    tower keeps only each block's inputs (a few MB per row). Its backward
+    goes one block at a time, from the last: it reruns that block for the
+    sequence with a one-row graph and for one reference at a time, and runs
+    tangermeme's rules on autograd through that block alone.
 ``engine="shared"``
     Works with any model. Forwards each sequence once with gradients, and each
     reference once without them, recording only the activations the rules
@@ -91,13 +93,14 @@ Input                          stock            shared           blockwise
 4 kb, DNase @ 1 bp             2.2 s, 4.1 GiB   1.2 s, 3.6 GiB   1.3 s, 2.4 GiB
 16 kb, RNA-seq @ 1 bp          does not fit     3.2 s, 7.2 GiB   1.7 s, 3.6 GiB
 32 kb, DNase @ 128 bp          3.9 s, 7.3 GiB   2.0 s, 6.7 GiB   2.0 s, 3.6 GiB
-131 kb, DNase @ 128 bp         does not fit     does not fit     7.6 s, 7.3 GiB
-131 kb, RNA-seq @ 1 bp         does not fit     does not fit     7.5 s, 7.4 GiB
+131 kb, DNase @ 128 bp         does not fit     does not fit     6.7 s, 5.7 GiB
+131 kb, RNA-seq @ 1 bp         does not fit     does not fit     7.4 s, 5.8 GiB
 =============================  ===============  ===============  ===============
 
-Peak memory includes 1.7 GiB of weights. The 131 kb rows use
-``ref_batch_size=1``. With 20 references (tangermeme's default) and one track,
-131 kb RNA-seq @ 1 bp takes 25 s at a 7.2 GiB peak.
+Peak memory includes 1.7 GiB of weights. Timings vary by up to 1 s between
+runs. The 131 kb rows use ``ref_batch_size=1``. With 20 references
+(tangermeme's default) and one track, 131 kb RNA-seq @ 1 bp takes 26 s at a
+5.6 GiB peak, or 23 s at 7.6 GiB with ``ref_batch_size=2``.
 
 ``deep_lift_shap`` returns the same ``AttributionResult`` (``base_matrix``) as
 ``gradient_x_input``, for a single sequence and the attributed window only.
@@ -230,13 +233,16 @@ context is about:
 
 * 0.9 GiB per row (the sequence, plus each reference in a chunk) for the U-Net
   skips,
-* 1.7 GiB for the sequence's tower graph and 1.2 GiB for one reference's
-  tower activations,
-* about 1.5 GiB of transients for the backward of the 1 bp encoder layers,
-  growing with ``ref_batch_size * n_tracks``.
+* about 1.1 GiB of transients in the tower backward (tangermeme's softmax,
+  tanh and bilinear rules on the attention logits of one block), whatever
+  ``ref_batch_size``,
+* about 1.7 GiB of transients per reference in a chunk for the 1 bp encoder
+  layers, forward, and about 2 GiB for their backward, growing with
+  ``ref_batch_size * n_tracks``.
 
-So ``ref_batch_size=1`` fits a 10 GiB card at full length, and larger chunks
-(fewer, larger kernel launches) pay off on 24 GB or larger cards. Lower
+So ``ref_batch_size=1`` fits a 10 GiB card at full length with room to spare,
+and ``ref_batch_size=2`` fits for one track. Larger chunks (fewer, larger
+kernel launches) pay off on 24 GB or larger cards. Lower
 ``track_batch_size`` to bound the gradient rows when attributing many tracks;
 each further batch of tracks recomputes the chunk's block activations.
 

@@ -14,11 +14,13 @@ without keeping an autograd graph over the convolutional parts of the model:
 * **The decoder is cropped.** Its receptive field is local (under 800 bp), so
   for a 1 bp window only the window plus ``decoder_margin`` bp of the decoder
   is computed, forward and backward. The encoder and tower always run in full.
-* **The transformer tower** runs on autograd with :class:`PairedRules`. The
-  sequence's one-row tower graph is kept for the whole call; each reference's
-  rule-site activations are recorded by rerunning the tower on that reference
-  (the tower is a small share of the compute), and one backward per
-  (reference, track) runs over the kept graph.
+* **The transformer tower** runs on autograd with :class:`PairedRules`, one
+  block at a time. Only each block's inputs ``(x, pair)`` are kept (a few MB
+  per row). The backward reruns each block, from the last, for the sequence
+  (one row, with a graph) and for one reference at a time (recording the
+  rule-site activations), then backpropagates each (reference, track) row
+  through that block alone. So at most one block's graph and one reference's
+  record exist at once.
 
 Every rule uses the sequence's gradient for both halves of a pair, which is
 exact because tangermeme's rules give both halves the same multiplier (see
@@ -367,9 +369,66 @@ def _tower_input(model, trunk, org_index):
     return trunk.transpose(1, 2) + model.organism_embed(org).unsqueeze(1)
 
 
-def _tower(model, tin):
-    out, _pair = model.tower(tin, compute_dtype=model.dtype_policy.compute_dtype)
-    return out
+def _tower_states(model, tin):
+    """Tower forward keeping only each block's inputs ``(x, pair)`` (pair None for block 0).
+
+    Returns (output (B, S, D), [(x_b, pair_b) per block]). A few MB per row.
+    """
+    tower, cd = model.tower, model.dtype_policy.compute_dtype
+    states, x, pair = [], tin, None
+    for block in tower.blocks:
+        states.append((x, pair))
+        x, pair = tower._forward_block(block, x, pair, cd)
+    return x, states
+
+
+def _tower_vjp(model, rules, states_x, states_r, g, reps):
+    """Tower backward under :class:`PairedRules`, one block at a time.
+
+    Rows of ``g`` (R, S, D) pair the sequence with reference ``row // reps``.
+    For each block, from the last: the sequence's inputs are rerun with a
+    graph (one row) under ``recording("x")``; then for each reference, its
+    inputs are rerun under ``recording("ref")`` and its rows are
+    backpropagated through that block one at a time. So one block's graph and
+    one reference's record exist at a time; between blocks only the ``(R, S,
+    D)`` and ``(R, P, P, C)`` gradients are kept. The final pair output feeds
+    only the contact-map head, so its gradient is zero.
+    """
+    tower, cd = model.tower, model.dtype_policy.compute_dtype
+    R = g.shape[0]
+    k = R // reps
+    gx, gp = g, None
+    for b in reversed(range(len(tower.blocks))):
+        block = tower.blocks[b]
+        (xb, pb), (rxb, rpb) = states_x[b], states_r[b]
+        xin = xb.detach().requires_grad_(True)
+        pin = None if pb is None else pb.detach().requires_grad_(True)
+        ins = [xin] if pin is None else [xin, pin]
+        with torch.enable_grad(), rules.recording("x"):
+            ox, op = tower._forward_block(block, xin, pin, cd)
+        use_pair = gp is not None and block["pair_update"] is not None
+        outs = [ox, op] if use_pair else [ox]
+        gx_in = torch.empty_like(gx)
+        gp_in = None if pin is None else gx.new_empty((R, *pin.shape[1:]))
+        for j in range(k):
+            with rules.recording("ref"):
+                tower._forward_block(block, rxb[j:j + 1],
+                                     None if rpb is None else rpb[j:j + 1], cd)
+            for row in range(j * reps, (j + 1) * reps):
+                gos = [gx[row:row + 1]] + ([gp[row:row + 1]] if use_pair else [])
+                last = j == k - 1 and row == R - 1
+                with torch.enable_grad():
+                    grads = torch.autograd.grad(outs, ins, gos, retain_graph=not last)
+                gx_in[row] = grads[0][0]
+                if pin is not None:
+                    gp_in[row] = grads[1][0]
+            rules.clear_reference()
+        rules.clear()
+        del ox, op, outs, xin, pin, ins
+        if gp is not None and block["pair_update"] is None:
+            gp_in = gp_in + gp  # the pair passes through unchanged
+        gx, gp = gx_in, gp_in
+    return gx
 
 
 def _head_states(plan, e):
@@ -616,36 +675,31 @@ def blockwise_deep_lift_shap(
         for i in range(N):
             x = X[i:i + 1].to(device=device, dtype=dtype)
             skips_x, trunk_x = _encode(enc, x)
-            tin_x = _tower_input(model, trunk_x, plan.org).requires_grad_(True)
-            with torch.enable_grad(), rules.recording("x"):
-                tout_x = _tower(model, tin_x)
-            sx = _post_tower(plan, tout_x.detach().transpose(1, 2), skips_x)
-            S_trunk = tin_x.shape[1]
+            tout_x, tstates_x = _tower_states(model, _tower_input(model, trunk_x, plan.org))
+            del trunk_x
+            sx = _post_tower(plan, tout_x.transpose(1, 2), skips_x)
+            S_trunk = tout_x.shape[1]
+            del tout_x
 
             for k0 in range(0, K, kbs):
                 r = references[i, k0:k0 + kbs].to(device=device, dtype=dtype)
                 k = r.shape[0]
                 skips_r, trunk_r = _encode(enc, r)
-                tin_r = _tower_input(model, trunk_r, plan.org)
+                tout_r, tstates_r = _tower_states(model, _tower_input(model, trunk_r, plan.org))
                 del trunk_r
-                sr = _post_tower(plan, _tower(model, tin_r).transpose(1, 2), skips_r)
+                sr = _post_tower(plan, tout_r.transpose(1, 2), skips_r)
+                del tout_r
                 y_diff = (sx["y"] - sr["y"]).double()  # (k, T)
 
                 for ts in track_chunks:
                     g_trunk, skip_grads = _post_tower_vjp(plan, sx, sr, ts, S_trunk)
-                    g_tin = torch.empty((k, len(ts), S_trunk, g_trunk.shape[2]),
-                                        dtype=dtype, device=device)
-                    for j in range(k):
-                        with rules.recording("ref"):
-                            _tower(model, tin_r[j:j + 1])
-                        for t in range(len(ts)):
-                            with torch.enable_grad():
-                                (gi,) = torch.autograd.grad(
-                                    tout_x, tin_x, grad_outputs=g_trunk[j, t].T.unsqueeze(0),
-                                    retain_graph=True)
-                            g_tin[j, t] = gi[0]
-                        rules.clear_reference()
+                    C_trunk = g_trunk.shape[2]
+                    g_out = g_trunk.permute(0, 1, 3, 2).reshape(k * len(ts), S_trunk, C_trunk)
                     del g_trunk
+                    g_tin = _tower_vjp(model, rules, tstates_x, tstates_r, g_out,
+                                       reps=len(ts))
+                    del g_out
+                    g_tin = g_tin.view(k, len(ts), S_trunk, C_trunk)
                     g = _encoder_vjp(enc, x, r, skips_x, skips_r,
                                      g_tin.transpose(2, 3), skip_grads)  # (k, t, 4, L)
                     del g_tin
@@ -663,9 +717,9 @@ def blockwise_deep_lift_shap(
                         hyp = hypothetical_attributions((flat,), (xs,), (rs,))[0]
                         hyp_sum[ts, i] += hyp.view(len(ts), k, *X.shape[1:]).sum(1).cpu()
                     del g
-                del skips_r, tin_r, sr
+                del skips_r, tstates_r, sr
             rules.clear()
-            del skips_x, tin_x, tout_x, sx
+            del skips_x, tstates_x, sx
 
     scale = diffs.abs().mean(dim=(1, 2), keepdim=True).clamp_min(1e-12)
     worst = float((deltas / scale).max()) if deltas.numel() else 0.0

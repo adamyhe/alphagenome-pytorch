@@ -33,6 +33,7 @@ over ``2 * batch_size`` rows), the model-agnostic shared-forward engine
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 from typing import Optional, Sequence
 
 import numpy as np
@@ -42,6 +43,7 @@ from torch import nn
 from ... import layers
 from ...attention import MHABlock
 from ...heads import GenomeTracksHead, predictions_scaling
+from .heads import HeadSelector, default_head_selector
 from .targets import Aggregate, _Link, prepare_aggregates
 from .types import BASES, AttributionResult
 
@@ -295,6 +297,7 @@ def deep_lift_shap_tracks(
     ref_batch_size: int = 4,
     track_batch_size: Optional[int] = None,
     aggregates: Optional[Sequence[Aggregate]] = None,
+    strand_averaged: bool = False,
 ) -> torch.Tensor:
     """DeepLIFT/SHAP attributions over the whole input.
 
@@ -347,7 +350,10 @@ def deep_lift_shap_tracks(
             * ``"stock"``: ``tangermeme.deep_lift_shap.deep_lift_shap`` once
               per track. The reference implementation.
             * ``"auto"`` (default): ``"blockwise"`` for ``AlphaGenome``
-              models, otherwise ``"shared"``.
+              models whose encoder, decoder, output embedders and head are
+              stock modules, otherwise ``"shared"`` (e.g. with Locon or other
+              adapters on the conv path, which the blockwise engine's
+              hand-written backward does not cover).
         ref_batch_size: ``engine="blockwise"`` only: references per chunk.
         track_batch_size: ``engine="blockwise"`` only: targets (tracks, or
             aggregates) per backward (default: all).
@@ -355,6 +361,13 @@ def deep_lift_shap_tracks(
             predictions of ``track_indices`` instead of each track separately
             (see :class:`~.targets.Aggregate`). Each costs what one track
             costs, however many tracks it combines.
+        strand_averaged: Also attribute the reverse-complemented sequence
+            (with the window flipped, and the same references
+            reverse-complemented), map it back to the forward strand, and
+            average. This is exact DeepLIFT/SHAP for the strand-averaged
+            prediction ``(f(x) + f(rc(x))) / 2``. Doubles compute. Like
+            ``gradient_x_input``, it pairs each track with itself on the other
+            strand, so use it for unstranded tracks.
 
     Returns:
         ``(T, N, 4, L)`` float32 tensor on the CPU, ``T = len(track_indices)``,
@@ -369,71 +382,112 @@ def deep_lift_shap_tracks(
     if device is None:
         device = next(model.parameters()).device
 
-    target = TrackTarget(
-        model, organism_index=organism_index, output_type=output_type,
-        resolution=resolution, target_slice=target_slice,
-        track_indices=track_indices, reduction=reduction,
-        experimental_space=experimental_space, aggregates=aggregates,
-    )
-    X = onehot.detach().float().transpose(1, 2).contiguous().cpu()  # (N, 4, L)
-    kwargs = dict(
-        batch_size=batch_size, hypothetical=hypothetical,
-        warning_threshold=float("inf") if warning_threshold is None else warning_threshold,
-        additional_nonlinear_ops=attribution_ops(),
-        dtype=torch.float32, device=device, random_state=random_state,
-        verbose=verbose,
-    )
-    if references is not None:
-        kwargs["references"] = references.float().cpu()
-    else:
-        kwargs["n_shuffles"] = n_shuffles
+    from ._blockwise import unsupported_modules
 
     if engine == "auto":
-        from ...model import AlphaGenome
-
-        engine = "blockwise" if isinstance(model, AlphaGenome) else "shared"
-    if engine == "shared":
-        from tangermeme._deep_lift_utils import _build_nonlinear_ops
-
-        from ._shared_forward import shared_forward_deep_lift_shap
-
-        with attributable(model):
-            result = shared_forward_deep_lift_shap(
-                target, X, targets=range(target.n_outputs),
-                nonlinear_ops=_build_nonlinear_ops(attribution_ops()),
-                references=kwargs.get("references"), n_shuffles=n_shuffles,
-                random_state=random_state, hypothetical=hypothetical,
-                device=device, dtype=torch.float32,
+        engine = "shared" if unsupported_modules(model, output_type) else "blockwise"
+    elif engine == "blockwise":
+        bad = unsupported_modules(model, output_type)
+        if bad:
+            raise ValueError(
+                "engine='blockwise' needs a stock AlphaGenome conv path; this model has "
+                f"{', '.join(bad[:5])}{' ...' if len(bad) > 5 else ''}. Use "
+                "engine='shared' (or 'auto', which picks it)."
             )
-        return result.attributions.float()
-    if engine == "blockwise":
-        from tangermeme._deep_lift_utils import _build_nonlinear_ops
-
-        from ._blockwise import blockwise_deep_lift_shap
-
-        with attributable(model):
-            result = blockwise_deep_lift_shap(
-                model, X, organism_index=organism_index, output_type=output_type,
-                resolution=resolution, target_slice=target_slice,
-                track_indices=track_indices, reduction=reduction,
-                experimental_space=experimental_space, aggregates=aggregates,
-                nonlinear_ops=_build_nonlinear_ops(attribution_ops()),
-                references=kwargs.get("references"), n_shuffles=n_shuffles,
-                random_state=random_state, hypothetical=hypothetical,
-                ref_batch_size=ref_batch_size, track_batch_size=track_batch_size,
-                device=device, dtype=torch.float32,
-            )
-        return result.attributions.float()
-    if engine != "stock":
+    elif engine not in ("shared", "stock"):
         raise ValueError(
             f"engine must be 'auto', 'blockwise', 'shared' or 'stock'; got {engine!r}."
         )
 
+    X = onehot.detach().float().transpose(1, 2).contiguous().cpu()  # (N, 4, L)
+    if references is not None:
+        references = references.float().cpu()
+    elif strand_averaged:
+        # Both strands need the same references (reverse-complemented for the
+        # second pass), so draw them here.
+        from ._shared_forward import tangermeme_references
+
+        references = tangermeme_references(X, n_shuffles, random_state)
+
+    def run(X_, refs, slice_, aggs):
+        target = TrackTarget(
+            model, organism_index=organism_index, output_type=output_type,
+            resolution=resolution, target_slice=slice_,
+            track_indices=track_indices, reduction=reduction,
+            experimental_space=experimental_space, aggregates=aggs,
+        )
+        if engine in ("shared", "blockwise"):
+            from tangermeme._deep_lift_utils import _build_nonlinear_ops
+
+            common = dict(nonlinear_ops=_build_nonlinear_ops(attribution_ops()),
+                          references=refs, n_shuffles=n_shuffles, random_state=random_state,
+                          hypothetical=hypothetical, device=device, dtype=torch.float32)
+            with attributable(model):
+                if engine == "shared":
+                    from ._shared_forward import shared_forward_deep_lift_shap
+
+                    result = shared_forward_deep_lift_shap(
+                        target, X_, targets=range(target.n_outputs), **common)
+                else:
+                    from ._blockwise import blockwise_deep_lift_shap
+
+                    result = blockwise_deep_lift_shap(
+                        model, X_, organism_index=organism_index, output_type=output_type,
+                        resolution=resolution, target_slice=slice_,
+                        track_indices=track_indices, reduction=reduction,
+                        experimental_space=experimental_space, aggregates=aggs,
+                        ref_batch_size=ref_batch_size, track_batch_size=track_batch_size,
+                        **common)
+            return result.attributions.float()
+
+        kwargs = dict(
+            batch_size=batch_size, hypothetical=hypothetical,
+            warning_threshold=float("inf") if warning_threshold is None else warning_threshold,
+            additional_nonlinear_ops=attribution_ops(),
+            dtype=torch.float32, device=device, random_state=random_state,
+            verbose=verbose,
+        )
+        if refs is not None:
+            kwargs["references"] = refs
+        else:
+            kwargs["n_shuffles"] = n_shuffles
+        with attributable(model):
+            return torch.stack([dls.deep_lift_shap(target, X_, target=t, **kwargs).float()
+                                for t in range(target.n_outputs)])
+
+    forward = run(X, references, target_slice, aggregates)
+    if not strand_averaged:
+        return forward
+
+    L = X.shape[-1]
+    if L % resolution:
+        raise ValueError(f"strand_averaged needs a length divisible by {resolution}; got {L}.")
+    n_bins = L // resolution
+    lo, hi, step = target_slice.indices(n_bins)
+    if step != 1:
+        raise ValueError("strand_averaged needs a unit-step target_slice.")
+    rc = run(_reverse_complement(X), _reverse_complement(references),
+             slice(n_bins - hi, n_bins - lo), _flip_aggregates(aggregates))
+    return 0.5 * (forward + _reverse_complement(rc))
+
+
+def _reverse_complement(t: torch.Tensor) -> torch.Tensor:
+    """Reverse-complement ``(..., 4, L)`` one-hot-layout tensors (ACGT channels)."""
+    return t.flip(-1)[..., [3, 2, 1, 0], :]
+
+
+def _flip_aggregates(aggregates):
+    """Aggregates for the reverse strand: per-bin weights ``(T, W)`` reversed along the window."""
+    if aggregates is None:
+        return None
     out = []
-    with attributable(model):
-        for t in range(target.n_outputs):
-            out.append(dls.deep_lift_shap(target, X, target=t, **kwargs).float())
-    return torch.stack(out)
+    for agg in aggregates:
+        terms = []
+        for t in agg.terms:
+            w = torch.as_tensor(t.weights)
+            terms.append(dataclasses.replace(t, weights=w.flip(-1) if w.dim() == 2 else w))
+        out.append(dataclasses.replace(agg, terms=tuple(terms)))
+    return out
 
 
 def deep_lift_shap(
@@ -449,6 +503,9 @@ def deep_lift_shap(
     n_shuffles: int = 20,
     random_state: Optional[int] = 0,
     batch_size: int = 1,
+    strand_averaged: bool = False,
+    head_selector: Optional[HeadSelector] = None,
+    include_raw_gradient: bool = False,
     sequence: str = "",
     target_start: int = 0,
     target_end: int = 0,
@@ -459,15 +516,29 @@ def deep_lift_shap(
     ``onehot`` is ``(1, L, 4)``. ``values[w, b, t]`` is the contribution at
     position ``w`` of the attributed window (the ``target_slice`` bins, in bp)
     for the observed base; other cells are NaN. With ``aggregates``, ``t``
-    indexes the aggregates (``metadata["aggregates"]`` holds their names). ``metadata["hypothetical"]``
-    holds the full ``(W, 4, T)`` hypothetical contributions. Extra keyword
-    arguments go to :func:`deep_lift_shap_tracks`.
+    indexes the aggregates (``metadata["aggregates"]`` holds their names).
+    ``metadata["hypothetical"]`` holds the full ``(W, 4, T)`` hypothetical
+    contributions. Registered as ``"deep_lift_shap"`` in :data:`.METHODS`, so
+    it takes the same arguments as the other methods.
+
+    Args:
+        strand_averaged: See :func:`deep_lift_shap_tracks`.
+        head_selector: Only the default (or None) is accepted: the engines
+            need AlphaGenome's own heads, not an arbitrary forward.
+        include_raw_gradient: Not supported (DeepLIFT has no raw gradient);
+            must be False.
+        **kwargs: Passed to :func:`deep_lift_shap_tracks` (e.g. ``engine``,
+            ``aggregates``, ``ref_batch_size``, ``device``).
     """
     if onehot.dim() != 3 or onehot.shape[0] != 1 or onehot.shape[2] != 4:
         raise ValueError(f"onehot must have shape (1, L, 4); got {tuple(onehot.shape)}.")
-    for unsupported in ("include_raw_gradient", "strand_averaged", "head_selector"):
-        if kwargs.pop(unsupported, None):
-            raise ValueError(f"{unsupported} is not supported for deep_lift_shap.")
+    if include_raw_gradient:
+        raise ValueError("include_raw_gradient is not supported for deep_lift_shap.")
+    if head_selector is not None and head_selector is not default_head_selector:
+        raise ValueError(
+            "deep_lift_shap runs AlphaGenome's own genome-track heads; a custom "
+            "head_selector is not supported."
+        )
     kwargs.pop("hypothetical", None)
 
     hyp = deep_lift_shap_tracks(
@@ -475,7 +546,7 @@ def deep_lift_shap(
         output_type=output_type, resolution=resolution, target_slice=target_slice,
         track_indices=track_indices, reduction=reduction, n_shuffles=n_shuffles,
         random_state=random_state, batch_size=batch_size, hypothetical=True,
-        **kwargs,
+        strand_averaged=strand_averaged, **kwargs,
     )  # (T, 1, 4, L)
     lo, hi = target_slice.start * resolution, target_slice.stop * resolution
     hyp_w = hyp[:, 0, :, lo:hi].permute(2, 1, 0).numpy()  # (W, 4, T)
@@ -501,7 +572,7 @@ def deep_lift_shap(
         reduction=reduction,
         metadata={
             "n_shuffles": n_shuffles, "random_state": random_state,
-            "hypothetical": hyp_w,
+            "strand_averaged": bool(strand_averaged), "hypothetical": hyp_w,
             **({"aggregates": [a.name for a in kwargs["aggregates"]]}
                if kwargs.get("aggregates") is not None else {}),
         },

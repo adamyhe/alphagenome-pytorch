@@ -144,12 +144,17 @@ per generated SNV of serialized AnnData score objects (one per scorer).
 --------------------------------------------------
 
 This endpoint computes per-nucleotide attribution scores for a target window
-inside a genomic interval. Two methods are supported:
+inside a genomic interval. Three methods are supported:
 
 - **input_x_gradient** — gradient × input projection (one forward + backward
   per track; always runs in fp32).
 - **saturation_ism** — saturation in-silico mutagenesis (batched forward passes
   mutating every position to every alternate base).
+- **deep_lift_shap** — DeepLIFT/SHAP against ``n_shuffles`` seeded
+  dinucleotide-shuffled references (see :doc:`../deep_lift_shap`). Needs the
+  ``attribution`` extra on the server and an interval without ``N`` bases.
+  Only ``"sum"`` and ``"mean"`` reductions. Values hold the contributions at
+  the observed bases (other cells are ``null``).
 
 Request fields
 ~~~~~~~~~~~~~~
@@ -181,7 +186,7 @@ Request fields
      - List of track indices to attribute (e.g. ``[0]``).
    * - ``method``
      - ✓
-     - ``"input_x_gradient"`` or ``"saturation_ism"``.
+     - ``"input_x_gradient"``, ``"saturation_ism"`` or ``"deep_lift_shap"``.
    * - ``organism``
      -
      - Organism identifier (default ``"HOMO_SAPIENS"``).
@@ -199,6 +204,10 @@ Request fields
    * - ``batch_size``
      -
      - Batch size for the ISM mutation loop (default ``8``).
+   * - ``n_shuffles``
+     -
+     - References for ``deep_lift_shap`` (default ``20``). Seeded, so the
+       same request returns the same attributions.
 
 Response
 ~~~~~~~~

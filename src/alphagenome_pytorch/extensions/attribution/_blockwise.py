@@ -288,6 +288,48 @@ def _embedder_vjp(emb, a_x, a_r, g, skip_factor: int = 0):
     return g_x, g_skip
 
 
+# -- supported structure ---------------------------------------------------------------
+
+
+def _blockwise_types() -> frozenset:
+    """Module types of a stock AlphaGenome conv path (encoder, decoder, embedders, track heads)."""
+    from ... import layers
+    from ...convolutions import ConvBlock, DnaEmbedder, DownResBlock, UpResBlock
+    from ...embeddings import OutputEmbedder
+    from ...heads import GenomeTracksHead, MultiOrganismConv1d
+    from ...model import SequenceDecoder, SequenceEncoder
+
+    return frozenset({
+        nn.Conv1d, nn.Embedding, nn.MaxPool1d, nn.ModuleDict, nn.ModuleList,
+        nn.ParameterDict, nn.Softplus, layers.GELU, layers.Pool1d, layers.RMSBatchNorm,
+        StandardizedConv1d, ConvBlock, DownResBlock, UpResBlock, DnaEmbedder,
+        SequenceEncoder, SequenceDecoder, OutputEmbedder, GenomeTracksHead,
+        MultiOrganismConv1d,
+    })
+
+
+def unsupported_modules(model: nn.Module, output_type: str) -> list:
+    """Conv-path modules the blockwise engine's hand-written backward does not cover.
+
+    Empty for a stock AlphaGenome (with or without fine-tuned weights). An
+    adapter (e.g. Locon on a conv, or a replaced head) shows up here, and the
+    engine would otherwise compute the wrong multipliers for it. The tower is
+    not checked: it runs on autograd, where adapters are handled by the rules.
+    """
+    from ...model import AlphaGenome
+
+    if not isinstance(model, AlphaGenome):
+        return [f"<model: {type(model).__name__}>"]
+    allowed = _blockwise_types()
+    parts = {"encoder": model.encoder, "decoder": model.decoder,
+             "embedder_128bp": model.embedder_128bp, "embedder_1bp": model.embedder_1bp}
+    if output_type in model.heads:
+        parts[f"heads.{output_type}"] = model.heads[output_type]
+    return [f"{prefix}.{name}".rstrip(".") + f" ({type(m).__name__})"
+            for prefix, part in parts.items() for name, m in part.named_modules()
+            if type(m) not in allowed]
+
+
 # -- plan and states ------------------------------------------------------------------
 
 

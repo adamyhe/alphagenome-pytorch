@@ -8,6 +8,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable
 
+from .deep_lift_shap import deep_lift_shap
 from .gradient import gradient_x_input
 from .ism import saturation_ism
 from .types import AttributionResult
@@ -30,6 +31,10 @@ METHODS: dict[str, MethodSpec] = {
     ),
     "saturation_ism": MethodSpec(
         func=saturation_ism, kind="base_matrix", supports_raw_gradient=False,
+    ),
+    # Needs the ``attribution`` extra (tangermeme) when called.
+    "deep_lift_shap": MethodSpec(
+        func=deep_lift_shap, kind="base_matrix", supports_raw_gradient=False,
     ),
 }
 

@@ -267,3 +267,21 @@ class FakeRuntime:
             if key.value == output_name:
                 return value
         return []
+
+
+class MiniRuntime(FakeRuntime):
+    """FakeRuntime with a scaled-down float32 AlphaGenome and a random (N-free) sequence.
+
+    For attribution methods that need AlphaGenome's own heads (DeepLIFT/SHAP).
+    """
+
+    def __init__(self):
+        super().__init__()
+        from .mini_alphagenome import MiniAlphaGenome
+
+        self.model = MiniAlphaGenome(dtype=torch.float32)
+
+    def get_sequence(self, interval, variant=None):
+        del variant
+        rng = np.random.default_rng(interval.start)
+        return ''.join(rng.choice(list('ACGT'), size=interval.width))

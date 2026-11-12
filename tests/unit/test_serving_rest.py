@@ -26,7 +26,7 @@ from alphagenome_pytorch.variant_scoring.types import (
     OutputType as PTOutputType,
 )
 
-from .serving_fakes import FakeAnndataModule, FakeRuntime, FakeScoringModel
+from .serving_fakes import FakeAnndataModule, FakeRuntime, FakeScoringModel, MiniRuntime
 
 
 def _start_rest(adapter):
@@ -56,8 +56,8 @@ def prediction_only_rest_server(monkeypatch):
     yield from _start_rest(adapter)
 
 
-def _post(host: str, port: int, path: str, body: bytes) -> tuple[int, dict]:
-    conn = http.client.HTTPConnection(host, port, timeout=10)
+def _post(host: str, port: int, path: str, body: bytes, timeout: float = 10) -> tuple[int, dict]:
+    conn = http.client.HTTPConnection(host, port, timeout=timeout)
     try:
         conn.request('POST', path, body=body, headers={'Content-Type': 'application/json'})
         response = conn.getresponse()
@@ -264,6 +264,39 @@ def test_explain_interval_ism_round_trip(rest_server):
     # Check that at least one cell is null (the reference base for each position)
     flat = json.dumps(values)
     assert 'null' in flat, 'Reference-base cells should serialize as null'
+
+
+@pytest.mark.filterwarnings('ignore:Convergence deltas:RuntimeWarning')
+def test_explain_interval_deep_lift_shap_round_trip():
+    pytest.importorskip('tangermeme.deep_lift_shap')
+    gen = _start_rest(LocalDnaModelAdapter(MiniRuntime()))
+    host, port = next(gen)
+    try:
+        body = json.dumps({
+            'interval': {'chromosome': 'chr1', 'start': 0, 'end': SEQUENCE_LENGTH_16KB},
+            'target_interval': {'chromosome': 'chr1', 'start': 8192, 'end': 8448},
+            'requested_output': 'dnase',
+            'resolution': 128,
+            'track_indices': [1],
+            'method': 'deep_lift_shap',
+            'n_shuffles': 1,
+        }).encode('utf-8')
+        # DeepLIFT on CPU, possibly beside other test workers: allow it time.
+        status, payload = _post(host, port, '/v1/explain_interval', body, timeout=120)
+        assert status == 200, payload
+        attr = payload['attribution']
+        assert attr['method'] == 'deep_lift_shap'
+        values = np.asarray(attr['values'], dtype=float)  # null -> nan
+        assert values.shape == (256, 4, 1)
+        assert (np.isfinite(values).sum(axis=1) == 1).all()
+
+        bad = json.loads(body)
+        bad['reduction'] = 'max'
+        status, payload = _post(host, port, '/v1/explain_interval', json.dumps(bad).encode())
+        assert status == 400
+        assert 'reduction' in payload['error']
+    finally:
+        gen.close()
 
 
 def test_explain_interval_unknown_method_400(rest_server):

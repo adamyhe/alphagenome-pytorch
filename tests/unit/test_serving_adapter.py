@@ -17,7 +17,7 @@ from alphagenome_pytorch.variant_scoring.types import (
     TrackMetadata as PTTrackMetadata,
 )
 
-from .serving_fakes import FakeAnndataModule, FakeRuntime, FakeScoringModel
+from .serving_fakes import FakeAnndataModule, FakeRuntime, FakeScoringModel, MiniRuntime
 
 
 @pytest.fixture
@@ -326,3 +326,69 @@ class TestExplainIntervalValidation:
                 track_indices=[0],
                 method='input_x_gradient',
             )
+
+
+# ---------------------------------------------------------------------------
+# explain_interval: DeepLIFT/SHAP through the method registry
+# ---------------------------------------------------------------------------
+
+
+class TestExplainIntervalDeepLiftShap:
+    @pytest.fixture
+    def mini_adapter(self):
+        pytest.importorskip('tangermeme.deep_lift_shap')
+        return LocalDnaModelAdapter(MiniRuntime())
+
+    def _explain(self, adapter, **kw):
+        interval = genome.Interval('chr1', 0, SEQUENCE_LENGTH_16KB)
+        args = dict(interval=interval, target_interval=genome.Interval('chr1', 8192, 8448),
+                    requested_output='dnase', resolution=128, track_indices=[0, 2],
+                    method='deep_lift_shap', n_shuffles=2)
+        args.update(kw)
+        return adapter.explain_interval(**args)
+
+    @pytest.mark.filterwarnings('ignore:Convergence deltas:RuntimeWarning')
+    def test_happy_path(self, mini_adapter):
+        result = self._explain(mini_adapter)
+        assert result.method == 'deep_lift_shap'
+        assert result.kind == 'base_matrix'
+        assert result.values.shape == (256, 4, 2)
+        # One finite (observed-base) cell per position and track.
+        assert (np.isfinite(result.values).sum(axis=1) == 1).all()
+        assert result.metadata['n_shuffles'] == 2
+        assert result.metadata['strand_averaged'] is False
+
+    @pytest.mark.filterwarnings('ignore:Convergence deltas:RuntimeWarning')
+    def test_strand_averaged_and_1bp(self, mini_adapter):
+        result = self._explain(mini_adapter, resolution=1, strand_averaged=True,
+                               target_interval=genome.Interval('chr1', 8000, 8100))
+        assert result.values.shape == (100, 4, 2)
+        assert result.metadata['strand_averaged'] is True
+
+    def test_max_reduction_rejected(self, mini_adapter):
+        with pytest.raises(ValueError, match='reduction'):
+            self._explain(mini_adapter, reduction='max')
+
+    def test_include_raw_gradient_rejected(self, mini_adapter):
+        with pytest.raises(ValueError, match='include_raw_gradient'):
+            self._explain(mini_adapter, include_raw_gradient=True)
+
+
+def test_deep_lift_shap_is_registered():
+    from alphagenome_pytorch.extensions.attribution import deep_lift_shap, get_method
+
+    spec = get_method('deep_lift_shap')
+    assert spec.func is deep_lift_shap
+    assert spec.kind == 'base_matrix'
+    assert not spec.supports_raw_gradient
+
+
+def test_deep_lift_shap_rejects_custom_head_selector():
+    import torch
+
+    from alphagenome_pytorch.extensions.attribution import deep_lift_shap
+
+    with pytest.raises(ValueError, match='head_selector'):
+        deep_lift_shap(torch.nn.Linear(1, 1), onehot=torch.zeros(1, 2048, 4), organism_index=0,
+                       output_type='dnase', resolution=128, target_slice=slice(0, 1),
+                       track_indices=[0], head_selector=lambda *a, **k: None)

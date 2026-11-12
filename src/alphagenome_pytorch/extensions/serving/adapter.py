@@ -441,11 +441,12 @@ class LocalDnaModelAdapter:
         include_raw_gradient: bool = False,
         strand_averaged: bool = False,
         batch_size: int = 8,
+        n_shuffles: int = 20,
     ) -> 'AttributionResult':
         """Nucleotide attribution over a target window inside an interval.
 
-        This is the serving surface for per-base attribution (gradient × input
-        and saturation ISM).  It calls into
+        This is the serving surface for per-base attribution (gradient × input,
+        saturation ISM and DeepLIFT/SHAP).  It calls into
         :mod:`alphagenome_pytorch.extensions.attribution` — **not** through
         ``VariantScoringModel.predict()`` — because gradient methods require an
         active autograd graph.
@@ -461,12 +462,16 @@ class LocalDnaModelAdapter:
                 enum, or its int value.
             resolution: Output resolution in bp (1 or 128).
             track_indices: Which tracks to attribute.
-            method: ``"input_x_gradient"`` or ``"saturation_ism"``.
-            reduction: Window reduction (``"sum"``, ``"mean"``, ``"max"``).
+            method: ``"input_x_gradient"``, ``"saturation_ism"`` or
+                ``"deep_lift_shap"`` (needs the ``attribution`` extra).
+            reduction: Window reduction (``"sum"``, ``"mean"``, ``"max"``;
+                ``deep_lift_shap`` takes ``"sum"`` or ``"mean"``).
             include_raw_gradient: Return full ``(W, 4, T)`` gradient tensor
                 (only valid for gradient-based methods).
             strand_averaged: Average forward and reverse-complement attributions.
             batch_size: Batch size for ISM mutation loop.
+            n_shuffles: Dinucleotide-shuffled references for
+                ``deep_lift_shap`` (seeded, so repeat requests agree).
 
         Returns:
             :class:`~alphagenome_pytorch.extensions.attribution.types.AttributionResult`.
@@ -564,6 +569,8 @@ class LocalDnaModelAdapter:
             kwargs["include_raw_gradient"] = include_raw_gradient
         if method == "saturation_ism":
             kwargs["batch_size"] = batch_size
+        if method == "deep_lift_shap":
+            kwargs["n_shuffles"] = int(n_shuffles)
 
         return method_spec.func(model, **kwargs)
 

@@ -612,6 +612,7 @@ class _ServingHandler(BaseHTTPRequestHandler):
                     include_raw_gradient=bool(body.get('include_raw_gradient', False)),
                     strand_averaged=bool(body.get('strand_averaged', False)),
                     batch_size=int(body.get('batch_size', 8)),
+                    n_shuffles=int(body.get('n_shuffles', 20)),
                 )
             except UnsupportedMethodError as exc:
                 msg = str(exc)

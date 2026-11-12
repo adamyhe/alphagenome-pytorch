@@ -22,8 +22,7 @@ pytestmark = pytest.mark.filterwarnings("ignore:Convergence deltas:RuntimeWarnin
 import tangermeme.deep_lift_shap as dls  # noqa: E402
 from tangermeme import _deep_lift_utils as rules  # noqa: E402
 
-from alphagenome_pytorch import convolutions, embeddings, heads, layers  # noqa: E402
-from alphagenome_pytorch.config import DtypePolicy  # noqa: E402
+from alphagenome_pytorch import layers  # noqa: E402
 from alphagenome_pytorch.extensions.attribution import (  # noqa: E402
     TrackTarget,
     attributable,
@@ -35,12 +34,8 @@ from alphagenome_pytorch.extensions.attribution.targets import Aggregate, Term  
 from alphagenome_pytorch.extensions.attribution._shared_forward import (  # noqa: E402
     shared_forward_deep_lift_shap,
 )
-from alphagenome_pytorch.model import (  # noqa: E402
-    AlphaGenome,
-    SequenceDecoder,
-    SequenceEncoder,
-    TransformerTower,
-)
+
+from .mini_alphagenome import MiniAlphaGenome, _onehot  # noqa: E402
 
 
 @pytest.fixture
@@ -51,63 +46,6 @@ def keep_float64(monkeypatch):
         torch.Tensor, "float",
         lambda self, *a, **k: self if self.dtype == torch.float64 else orig(self, *a, **k),
     )
-
-
-def _onehot(n: int, length: int, seed: int) -> torch.Tensor:
-    g = torch.Generator().manual_seed(seed)
-    idx = torch.randint(0, 4, (n, length), generator=g)
-    return F.one_hot(idx, 4).double().transpose(1, 2).contiguous()
-
-
-class MiniAlphaGenome(AlphaGenome):
-    """AlphaGenome's structure (6 down blocks, 9 tower blocks, 7 up blocks, track
-    heads) with base width ``c`` instead of 768. Uses AlphaGenome's own forward."""
-
-    def __init__(self, c: int = 8, n_tracks: int = 4, num_organisms: int = 2,
-                 dtype: torch.dtype = torch.float64):
-        nn.Module.__init__(self)
-        torch.manual_seed(0)
-        self.num_organisms = num_organisms
-        self.dtype_policy = DtypePolicy(dtype, dtype, dtype)
-        enc = SequenceEncoder()
-        enc.dna_embedder.conv1 = nn.Conv1d(4, c, 15, padding="same")
-        enc.dna_embedder.block = convolutions.ConvBlock(c, c, 5)
-        enc.down_blocks = nn.ModuleList(convolutions.DownResBlock(c + 128 * i) for i in range(6))
-        self.encoder = enc
-        d = c + 128 * 6
-        self.organism_embed = nn.Embedding(num_organisms, d)
-        self.tower = TransformerTower(d_model=d)
-        dec = SequenceDecoder()
-        skip = {b: c + 128 * i for i, b in enumerate([1, 2, 4, 8, 16, 32, 64])}
-        ups, cur = [], d
-        for b in dec.bin_sizes:
-            ups.append(convolutions.UpResBlock(cur, skip[b]))
-            cur = skip[b]
-        dec.up_blocks = nn.ModuleList(ups)
-        self.decoder = dec
-        self.embedder_128bp = embeddings.OutputEmbedder(d, 2 * d, num_organisms)
-        self.embedder_1bp = embeddings.OutputEmbedder(c, 16, num_organisms)
-        self.embedder_1bp.project_skip = nn.Conv1d(2 * d, 16, 1, bias=False)
-        self.embedder_pair = embeddings.OutputPair(dim=128, num_organisms=num_organisms)
-        dims = {1: 16, 128: 2 * d}
-        self.heads = nn.ModuleDict({
-            "dnase": heads.GenomeTracksHead(dims, n_tracks, (1, 128), num_organisms,
-                                            track_means=torch.rand(num_organisms, n_tracks) + 0.5),
-            "rna_seq": heads.GenomeTracksHead(dims, n_tracks, (1, 128), num_organisms,
-                                              apply_squashing=True,
-                                              track_means=torch.rand(num_organisms, n_tracks) + 0.5),
-        })
-        self.contact_maps_head = None
-        self.splice_sites_classification_head = None
-        self.splice_sites_usage_head = None
-        self.splice_sites_junction_head = None
-        with torch.no_grad():  # non-trivial norm statistics, so the rules see them
-            for m in self.modules():
-                if isinstance(m, layers.RMSBatchNorm):
-                    m.running_var.uniform_(0.5, 2.0)
-                    m.weight.uniform_(0.5, 1.5)
-                    m.bias.uniform_(-0.2, 0.2)
-        self.to(dtype).eval()
 
 
 @pytest.fixture(scope="module")
@@ -389,3 +327,91 @@ def test_aggregate_weight_shape_is_checked(mini, weights):
                       target_slice=slice(4, 8), track_indices=[0, 1, 2], reduction="sum",
                       experimental_space=True, length=2048, decoder_margin=1024,
                       aggregates=[Aggregate.weighted(weights)])
+
+
+# ---------------------------------------------------------------------------
+# Strand averaging and engine selection
+# ---------------------------------------------------------------------------
+
+
+def _rc(t):
+    return t.flip(-1)[..., [3, 2, 1, 0], :]
+
+
+class _StrandAveraged(nn.Module):
+    """``(f(x) + f_rc(rc(x))) / 2`` as one model, for the shared engine to attribute."""
+
+    def __init__(self, fwd, rev):
+        super().__init__()
+        self.fwd, self.rev = fwd, rev
+
+    def forward(self, x):
+        return 0.5 * (self.fwd(x) + self.rev(_rc(x)))
+
+
+@pytest.mark.parametrize("engine,resolution,window", [
+    ("blockwise", 1, slice(100, 400)),
+    ("shared", 128, slice(3, 7)),
+    ("blockwise", 128, slice(0, 2)),
+])
+def test_strand_averaged_is_deep_lift_of_the_averaged_model(engine, resolution, window):
+    """Against the shared engine run on one model that averages both strands."""
+    from alphagenome_pytorch.extensions.attribution._shared_forward import tangermeme_references
+
+    model = MiniAlphaGenome(dtype=torch.float32)
+    L = 2048
+    X = _onehot(1, L, seed=12).float()
+    refs = tangermeme_references(X, 3, 5)
+    n_bins = L // resolution
+    W = window.stop - window.start
+    profile = torch.rand(2, W, generator=torch.Generator().manual_seed(3))
+    aggs = [Aggregate.weighted(torch.tensor([1.0, -0.5])), Aggregate.weighted(profile)]
+    aggs_rc = [aggs[0], Aggregate.weighted(profile.flip(-1))]
+    spec = dict(organism_index=1, output_type="dnase", resolution=resolution,
+                track_indices=[2, 0])
+    rc_window = slice(n_bins - window.stop, n_bins - window.start)
+
+    def expected(a_fwd, a_rc):
+        avg = _StrandAveraged(TrackTarget(model, **spec, target_slice=window, aggregates=a_fwd),
+                              TrackTarget(model, **spec, target_slice=rc_window, aggregates=a_rc))
+        with attributable(model):
+            return shared_forward_deep_lift_shap(
+                avg, X, targets=range(avg.fwd.n_outputs), nonlinear_ops=_ops(),
+                references=refs, hypothetical=True, device="cpu").attributions
+
+    kw = dict(onehot=X.transpose(1, 2), target_slice=window, references=refs, engine=engine,
+              strand_averaged=True, **spec)
+    for a_fwd, a_rc in [(None, None), (aggs, aggs_rc)]:
+        want = expected(a_fwd, a_rc)
+        got = deep_lift_shap_tracks(model, aggregates=a_fwd, **kw)
+        assert got.shape == want.shape
+        tol = 1e-5 if engine == "shared" else 1e-3  # float32; see the float32 test above
+        assert float((got - want).norm() / want.norm()) < tol
+
+
+def test_strand_averaged_differs_from_one_strand():
+    model = MiniAlphaGenome(dtype=torch.float32)
+    kw = dict(onehot=_onehot(1, 2048, seed=13).float().transpose(1, 2), organism_index=0,
+              output_type="dnase", resolution=128, target_slice=slice(4, 8),
+              track_indices=[1], n_shuffles=2, random_state=0)
+    one = deep_lift_shap_tracks(model, **kw)
+    both = deep_lift_shap_tracks(model, strand_averaged=True, **kw)
+    assert float((both - one).norm() / one.norm()) > 1e-2
+
+
+def test_auto_engine_falls_back_for_conv_adapters():
+    from alphagenome_pytorch.extensions.finetuning.adapters import apply_locon
+
+    model = MiniAlphaGenome(dtype=torch.float32)
+    assert bw.unsupported_modules(model, "dnase") == []
+    apply_locon(model, ["conv"], rank=2)
+    model.eval()
+    assert any("Locon" in m for m in bw.unsupported_modules(model, "dnase"))
+    kw = dict(onehot=_onehot(1, 2048, seed=14).float().transpose(1, 2), organism_index=0,
+              output_type="dnase", resolution=128, target_slice=slice(4, 8),
+              track_indices=[1], n_shuffles=2, random_state=0)
+    with pytest.raises(ValueError, match="stock AlphaGenome conv path"):
+        deep_lift_shap_tracks(model, engine="blockwise", **kw)
+    torch.testing.assert_close(deep_lift_shap_tracks(model, **kw),
+                               deep_lift_shap_tracks(model, engine="shared", **kw),
+                               rtol=0, atol=0)

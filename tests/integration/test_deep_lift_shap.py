@@ -116,3 +116,19 @@ def test_pretrained_blockwise_aggregates_match_shared(model, output_type, resolu
     for a in range(2):
         torch.testing.assert_close(block[a], shared[a], rtol=0,
                                    atol=1e-3 * float(shared[a].abs().max()))
+
+
+@pytest.mark.parametrize("output_type,resolution,length", [("dnase", 128, L), ("dnase", 1, 16384)])
+def test_pretrained_strand_averaged_blockwise_matches_shared(model, output_type, resolution, length):
+    from alphagenome_pytorch.extensions.attribution import deep_lift_shap_tracks
+
+    g = torch.Generator().manual_seed(4)
+    onehot = F.one_hot(torch.randint(0, 4, (1, length), generator=g), 4).float()
+    bins = length // resolution
+    half = 4 if resolution == 128 else 250
+    kw = dict(onehot=onehot, organism_index=0, output_type=output_type,
+              resolution=resolution, target_slice=slice(bins // 3 - half, bins // 3 + half),
+              track_indices=[0, 5], n_shuffles=2, random_state=0, strand_averaged=True)
+    shared = deep_lift_shap_tracks(model, engine="shared", **kw)
+    block = deep_lift_shap_tracks(model, engine="blockwise", ref_batch_size=2, **kw)
+    torch.testing.assert_close(block, shared, rtol=0, atol=1e-3 * float(shared.abs().max()))

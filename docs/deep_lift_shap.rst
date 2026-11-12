@@ -104,7 +104,17 @@ runs. The 131 kb rows use ``ref_batch_size=1``. With 20 references
 
 ``deep_lift_shap`` returns the same ``AttributionResult`` (``base_matrix``) as
 ``gradient_x_input``, for a single sequence and the attributed window only.
-The full hypothetical contributions are in ``metadata["hypothetical"]``.
+The full hypothetical contributions are in ``metadata["hypothetical"]``. It is
+registered as ``"deep_lift_shap"`` in the attribution method registry, so
+serving's ``explain_interval`` (REST ``/v1/explain_interval``) can run it.
+
+``engine="auto"`` checks the model's structure, not just its class. The
+blockwise engine hand-writes the backward of the encoder, decoder, output
+embedders and head, so it only runs when those are AlphaGenome's own modules.
+An adapter on that path (Locon on the convolutions, or a replaced head) makes
+``"auto"`` pick ``"shared"``, and ``engine="blockwise"`` raises. Adapters in the
+transformer tower (LoRA, IA3, Houlsby) are fine for every engine: the tower
+runs on autograd, where tangermeme's rules apply to whatever modules it has.
 
 What is attributed
 ------------------
@@ -115,6 +125,18 @@ Output ``t`` is the ``reduction`` (``"sum"`` or ``"mean"``) over the bins in
 attribute the model-space prediction instead. ``"max"`` is not supported
 because it has no DeepLIFT rule. With a fixed ``random_state``, every track
 uses the same dinucleotide-shuffled references.
+
+Strand averaging
+~~~~~~~~~~~~~~~~
+
+``strand_averaged=True`` attributes the reverse-complemented sequence too, over
+the mirrored window and against the same references reverse-complemented,
+maps that result back to the forward strand, and averages the two. This is
+exact DeepLIFT/SHAP for the strand-averaged prediction
+``(f(x) + f(rc(x))) / 2``, so the summation property still holds for it. It
+doubles the compute. As with ``gradient_x_input``, each track is paired with
+itself on the other strand, so use it for unstranded tracks. Per-bin aggregate
+weights are mirrored along the window for the reverse pass.
 
 Aggregate targets
 ~~~~~~~~~~~~~~~~~
